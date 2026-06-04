@@ -40,8 +40,8 @@ jobs:
       - uses: robinraju/release-downloader@v1.4
         name: Download duckdb
         with:
-          repository: "duckdb/duckdb"
-          tag: "v1.4.2"
+          repository: "pegasi-e/ddb"
+          tag: "v1.4.2.27"
           fileName: ${{ matrix.duckdb }}
           out-file-path: .
 
