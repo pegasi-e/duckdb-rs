@@ -54,8 +54,8 @@ jobs:
         name: Download duckdb
         if: matrix.os == 'windows-latest'
         with:
-          repository: "duckdb/duckdb"
-          tag: "v1.5.3"
+          repository: "pegasi-e/ddb"
+          tag: "v1.4.2.27"
           fileName: ${{ matrix.duckdb }}
           out-file-path: .
 
