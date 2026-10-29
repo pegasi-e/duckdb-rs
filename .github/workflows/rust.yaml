@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: bundled-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
 jobs:
   bundled:
     strategy:
@@ -20,9 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Check bundle checksum
-        shell: bash
-        run: python3 -c "import hashlib,pathlib; p=pathlib.Path('crates/libduckdb-sys/duckdb.tar.gz'); assert hashlib.sha256(p.read_bytes()).hexdigest() == pathlib.Path(str(p)+'.sha256').read_text().split()[0]"
+      - name: Check DuckDB fork compatibility
+        run: python3 scripts/check_fork_compat.py
       - run: cargo fmt --all -- --check
       - run: cargo build --release --locked -p duckdb --features bundled
       - run: cargo run --release --locked -p duckdb --example fork_smoke --features bundled

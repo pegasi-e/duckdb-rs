@@ -32,6 +32,15 @@ cargo run --release --locked -p duckdb --example fork_smoke --features bundled
 cargo test --release --locked -p libduckdb-sys --features bundled
 ```
 
+Upstream sync policy: this branch remains a DuckDB 1.5 compatibility line.
+Upstream `main` now targets a 2.0 preview, including `duckdb-neo`, v2 C bindings,
+and new C API calls unavailable in our engine. Those changes are not built or
+published here. We retain the existing 1.10503.1 Rust API and selectively carry
+compatible fixes and dependency updates. The upstream sync at `a7acfc4` is
+reconciled without upgrading the engine or exposing the Anybase-specific C API.
+Run `python3 scripts/check_fork_compat.py` to check the bundle, provenance and
+native binding declarations before a build.
+
 To regenerate the source bundle, update the submodule and `duckdb-fork.json`
 together, then run `./upgrade.sh`. This preserves the public Rust bindings.
 The source commit must match the pin and have no tracked modifications.
