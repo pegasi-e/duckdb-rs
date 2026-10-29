@@ -127,5 +127,16 @@ pub fn main(out_dir: &str, out_path: &Path) {
     }
     cfg.compile("duckdb");
 
+    // Static archives do not propagate DuckDB's Windows system dependencies.
+    // Match duckdb-sources/src/CMakeLists.txt, including Restart Manager for
+    // AdditionalLockInfo's RmStartSession/RmGetList calls.
+    if win_target() {
+        println!("cargo:rustc-link-lib=dylib=ws2_32");
+        println!("cargo:rustc-link-lib=dylib=rstrtmgr");
+        if std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|env| env == "msvc") {
+            println!("cargo:rustc-link-lib=dylib=bcrypt");
+        }
+    }
+
     println!("cargo:lib_dir={out_dir}");
 }
