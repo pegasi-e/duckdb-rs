@@ -46,8 +46,8 @@ together, then run `./upgrade.sh`. This preserves the public Rust bindings.
 The source commit must match the pin and have no tracked modifications.
 The bundle checksum is recorded in `duckdb.tar.gz.sha256`.
 
-CI builds bundled crates on Linux, macOS and Windows and uploads Cargo packages,
-the complete source workspace, and the host smoke executable. Extract the source
+CI builds bundled crates on Linux x86-64 and ARM64, macOS, and Windows. It uploads
+Cargo packages, the complete source workspace, and the host smoke executable. Extract the source
 workspace archive to use the local `path` dependency shown above; it retains the
 internal path dependencies so the engine stays on this fork. Individual `.crate`
 files retain upstream names and versions: consuming them separately requires
