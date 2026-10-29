@@ -741,6 +741,36 @@ mod test {
     }
 
     #[test]
+    fn test_native_csv_exception_returns_error() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-utf8.csv");
+        let mut contents = b"value\n".to_vec();
+        contents.extend(b"valid\n".repeat(4096));
+        contents.extend_from_slice(b"invalid\xff\n");
+        std::fs::write(&path, contents).unwrap();
+
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("SET threads = 2")?;
+        let filename = path.to_string_lossy().replace('\'', "''");
+        let result: Result<i64> = db.query_row(
+            &format!(
+                "SELECT sum(length(value)) FROM read_csv('{filename}', \
+                 auto_detect = false, header = true, columns = {{'value': 'VARCHAR'}}, \
+                 parallel = true, buffer_size = 1024, max_line_size = 128)"
+            ),
+            [],
+            |row| row.get(0),
+        );
+        let error = result.expect_err("invalid UTF-8 must return a native error");
+        assert!(matches!(error, Error::DuckDBFailure(_, _)));
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(message.contains("unicode") || message.contains("utf-8"), "{message}");
+        let answer: i32 = db.query_row("SELECT 42", [], |row| row.get(0))?;
+        assert_eq!(answer, 42);
+        Ok(())
+    }
+
+    #[test]
     fn test_params_of_vary_types() -> Result<()> {
         let db = checked_memory_handle();
         let sql = "BEGIN;

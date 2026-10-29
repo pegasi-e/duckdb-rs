@@ -70,6 +70,13 @@ pub fn main(out_dir: &str, out_path: &Path) {
         .define("CMAKE_C_FLAGS_INIT", warning_suppression_flag())
         .define("CMAKE_CXX_FLAGS_INIT", warning_suppression_flag());
 
+    // The cmake crate replaces CMAKE_CXX_FLAGS, dropping CMake's default
+    // /EHsc. Keep native errors inside DuckDB's C API on MSVC (#774).
+    // Do not define CMAKE_CXX_FLAGS explicitly: that would discard cxxflag.
+    if win_target() && is_compiler("msvc") {
+        config.cxxflag("/EHsc");
+    }
+
     // Unity builds (DuckDB's default) combine .cpp files into fewer translation
     // units and compile significantly faster. Allow opting out for debugging.
     // Always set explicitly so the CMake cache doesn't keep a stale value.

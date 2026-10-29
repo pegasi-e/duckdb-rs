@@ -29,6 +29,8 @@ jobs:
       - run: cargo build --release --locked -p duckdb --features bundled
       - run: cargo run --release --locked -p duckdb --example fork_smoke --features bundled
       - run: cargo test --release --locked -p libduckdb-sys --features bundled
+      - name: Check native exception handling
+        run: cargo test --release --locked -p duckdb --lib --features bundled test_native_csv_exception_returns_error -- --nocapture
       - run: cargo test --release --locked -p duckdb --lib --features bundled
       - name: Test upstream timestamp compatibility fix
         run: cargo test --release --locked -p duckdb --lib --features "bundled chrono" test_naive_date_time_before_epoch

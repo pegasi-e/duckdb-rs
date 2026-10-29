@@ -17,7 +17,6 @@ fn win_target() -> bool {
 /// the content of `CARGO_CFG_TARGET_ENV` (and is always lowercase)
 ///
 /// See [`win_target`]
-#[cfg(any(not(feature = "bundled"), feature = "bundled-cmake"))]
 fn is_compiler(compiler_name: &str) -> bool {
     std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|v| v == compiler_name)
 }

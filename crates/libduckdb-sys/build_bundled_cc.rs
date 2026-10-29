@@ -1,4 +1,4 @@
-use crate::{win_target, write_bindings};
+use crate::{is_compiler, win_target, write_bindings};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -114,6 +114,13 @@ pub fn main(out_dir: &str, out_path: &Path) {
         .warnings(false)
         .flag_if_supported("-w");
 
+    // MSVC requires explicit exception handling so DuckDB catches native
+    // errors at its C API boundary instead of unwinding into Rust (#774).
+    // Use a hard flag: a failed capability probe must not silently omit it.
+    if win_target() && is_compiler("msvc") {
+        cfg.flag("/EHsc");
+    }
+
     let is_debug = match std::env::var("DEBUG") {
         Ok(v) => v != "false" && v != "0",
         Err(_) => false,
@@ -133,7 +140,7 @@ pub fn main(out_dir: &str, out_path: &Path) {
     if win_target() {
         println!("cargo:rustc-link-lib=dylib=ws2_32");
         println!("cargo:rustc-link-lib=dylib=rstrtmgr");
-        if std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|env| env == "msvc") {
+        if is_compiler("msvc") {
             println!("cargo:rustc-link-lib=dylib=bcrypt");
         }
     }
