@@ -37,9 +37,13 @@ together, then run `./upgrade.sh`. This preserves the public Rust bindings.
 The source commit must match the pin and have no tracked modifications.
 The bundle checksum is recorded in `duckdb.tar.gz.sha256`.
 
-CI builds bundled crates on Linux, macOS and Windows and uploads Cargo packages
-and the host smoke executable. These packages retain upstream crate names;
-consume this fork via Git/path or a private registry rather than crates.io.
+CI builds bundled crates on Linux, macOS and Windows and uploads Cargo packages,
+the complete source workspace, and the host smoke executable. Extract the source
+workspace archive to use the local `path` dependency shown above; it retains the
+internal path dependencies so the engine stays on this fork. Individual `.crate`
+files retain upstream names and versions: consuming them separately requires
+patching both crates to local paths or configuring a private registry. Prefer
+the Git dependency or complete source workspace for applications.
 Rust `.rlib` files are compiler/target specific and are not portable SDKs.
 
 ---
