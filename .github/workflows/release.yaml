@@ -1,27 +1,12 @@
+# Fork artifacts are built by rust.yaml. Publishing under the upstream crates.io
+# names is intentionally disabled; applications use the fork Git dependency.
 name: Release
-
 on:
   workflow_dispatch:
-  push:
-    tags: ["*"]
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: full
+permissions:
+  contents: read
 jobs:
-  release:
-    name: Cargo Publish
+  usage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: publish crates
-        uses: katyo/publish-crates@v2
-        with:
-          path: "./"
-          args: --no-verify --allow-dirty --all-features
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          ignore-unpublished-changes: true
-
-# NOTE: After running this action, manually create a new release via https://github.com/duckdb/duckdb-rs/releases/new
-# TODO: Automate the entire release process
+      - run: echo "Use the Bundled fork workflow artifacts or the pinned Git dependency."

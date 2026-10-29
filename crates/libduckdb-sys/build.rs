@@ -277,9 +277,14 @@ mod build_linked {
     }
 
     fn should_download_libduckdb() -> bool {
-        env::var("DUCKDB_DOWNLOAD_LIB")
+        let requested = env::var("DUCKDB_DOWNLOAD_LIB")
             .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        assert!(
+            !requested,
+            "This fork does not download upstream DuckDB binaries; enable bundled or set DUCKDB_LIB_DIR to a build of the pinned fork"
+        );
+        false
     }
 
     fn download_libduckdb(out_dir: &str) -> Result<HeaderLocation, Box<dyn std::error::Error>> {

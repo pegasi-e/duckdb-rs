@@ -1,3 +1,49 @@
+# Anybase DuckDB Rust bindings
+
+This fork bundles [our DuckDB fork](https://github.com/jeremyosterhoudt/duckdb)
+1.5.6 at `d5adf13edc1d1964573f2e80bb44ccd85f1bb524`, using duckdb-rs
+`1.10503.1` (organization fork commit `7594681`) as the Rust API baseline. Existing Rust wrappers and pregenerated
+FFI bindings are unchanged; custom native APIs are not exposed by this change.
+The crate version remains the upstream Rust API baseline, not the engine version.
+
+Use the Git dependency with `bundled` enabled (pin the resulting Rust fork commit
+with `rev` for reproducible application builds):
+
+```toml
+[dependencies]
+duckdb = { git = "https://github.com/pegasi-e/duckdb-rs", branch = "codex/anybase-bundled", features = ["bundled"] }
+```
+
+For local use, replace `git` and `branch` with
+`path = "/path/to/duckdb-rs/crates/duckdb"`. If a dependency also uses the
+crates.io packages, patch both `duckdb` and `libduckdb-sys` to this repository
+under `[patch.crates-io]` in the application's root manifest.
+
+`bundled` compiles the checked-in `duckdb.tar.gz` and requires a C++ compiler.
+Use `json` and/or `parquet` as usual to include those extensions. Non-bundled
+system-library mode is still supported via `DUCKDB_LIB_DIR`, but setting
+`DUCKDB_DOWNLOAD_LIB=1` is rejected to prevent downloading the upstream engine.
+
+Build and verify on the host platform:
+
+```sh
+cargo build --release --locked -p duckdb --features bundled
+cargo run --release --locked -p duckdb --example fork_smoke --features bundled
+cargo test --release --locked -p libduckdb-sys --features bundled
+```
+
+To regenerate the source bundle, update the submodule and `duckdb-fork.json`
+together, then run `./upgrade.sh`. This preserves the public Rust bindings.
+The source commit must match the pin and have no tracked modifications.
+The bundle checksum is recorded in `duckdb.tar.gz.sha256`.
+
+CI builds bundled crates on Linux, macOS and Windows and uploads Cargo packages
+and the host smoke executable. These packages retain upstream crate names;
+consume this fork via Git/path or a private registry rather than crates.io.
+Rust `.rlib` files are compiler/target specific and are not portable SDKs.
+
+---
+
 # duckdb-rs
 
 [![Latest Version](https://img.shields.io/crates/v/duckdb.svg)](https://crates.io/crates/duckdb)

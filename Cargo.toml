@@ -9,8 +9,8 @@ members = [
 [workspace.package]
 version = "1.10503.1"
 authors = ["DuckDB Labs and contributors", "wangfenjin <wangfenj@gmail.com>"]
-repository = "https://github.com/duckdb/duckdb-rs"
-homepage = "https://github.com/duckdb/duckdb-rs"
+repository = "https://github.com/pegasi-e/duckdb-rs"
+homepage = "https://github.com/pegasi-e/duckdb-rs"
 documentation = "http://docs.rs/duckdb/"
 readme = "README.md"
 keywords = ["duckdb", "database", "ffi"]

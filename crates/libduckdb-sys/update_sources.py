@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import gzip
+import hashlib
+import subprocess
 import json
 import os
 import shutil
@@ -11,6 +13,19 @@ import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+with (SCRIPT_DIR / "duckdb-fork.json").open() as f:
+    fork = json.load(f)
+source_dir = SCRIPT_DIR / "duckdb-sources"
+actual_commit = subprocess.check_output(
+    ["git", "-C", str(source_dir), "rev-parse", "HEAD"], text=True
+).strip()
+if actual_commit != fork["commit"]:
+    raise SystemExit(f"Expected DuckDB {fork['commit']}, found {actual_commit}")
+subprocess.check_call(["git", "-C", str(source_dir), "diff", "--exit-code", "HEAD", "--"])
+# The inherited tags in this fork do not describe its upstream API version.
+os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = fork["version"]
+os.environ["SETUPTOOLS_SCM_PRETEND_HASH"] = fork["commit"][:11]
 
 DUCKDB_SCRIPTS_DIR = SCRIPT_DIR / "duckdb-sources" / "scripts"
 TARGET_DIR = SCRIPT_DIR / "duckdb"
@@ -180,3 +195,8 @@ def replace_archive_if_changed():
 
 
 replace_archive_if_changed()
+
+with ARCHIVE_PATH.open("rb") as f:
+    digest = hashlib.sha256(f.read()).hexdigest()
+with Path(str(ARCHIVE_PATH) + ".sha256").open("w") as f:
+    f.write(f"{digest}  duckdb.tar.gz\n")
