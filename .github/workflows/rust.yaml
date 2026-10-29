@@ -30,6 +30,8 @@ jobs:
       - run: cargo run --release --locked -p duckdb --example fork_smoke --features bundled
       - run: cargo test --release --locked -p libduckdb-sys --features bundled
       - run: cargo test --release --locked -p duckdb --lib --features bundled
+      - name: Test upstream timestamp compatibility fix
+        run: cargo test --release --locked -p duckdb --lib --features "bundled chrono" test_naive_date_time_before_epoch
       - name: Package Rust crates
         run: cargo package --locked --no-verify -p libduckdb-sys -p duckdb-loadable-macros -p duckdb
       - name: Package complete source workspace
