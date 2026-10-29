@@ -1,12 +1,36 @@
-# Fork artifacts are built by rust.yaml. Publishing under the upstream crates.io
-# names is intentionally disabled; applications use the fork Git dependency.
-name: Release
+name: Archive build ZIPs
 on:
   workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Bundled fork workflow run to archive
+        required: true
+        type: string
+        default: "40962050450"
+      dry_run:
+        description: Download and verify ZIPs without uploading to Artifactory
+        type: boolean
+        default: false
 permissions:
   contents: read
+  actions: read
+concurrency:
+  group: archive-build-zips-${{ inputs.source_run_id }}
+  cancel-in-progress: false
 jobs:
-  usage:
+  archive:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Use the Bundled fork workflow artifacts or the pinned Git dependency."
+      - uses: actions/checkout@v5
+      - name: Check archive behavior
+        run: python3 -m unittest discover -s scripts -p test_archive_artifacts.py
+      - name: Archive original GitHub artifact ZIPs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          ARCHIVE_DRY_RUN: ${{ inputs.dry_run }}
+          ARTIFACTORY_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
+          ARTIFACTORY_BASE_URL: ${{ vars.ARTIFACTORY_BASE_URL || 'https://gart.software.gevernova.com/artifactory' }}
+          ARTIFACTORY_GENERIC_REPOSITORY: ${{ vars.ARTIFACTORY_GENERIC_REPOSITORY || 'data-fabric-generic' }}
+          ARTIFACTORY_ARCHIVE_PREFIX: ${{ vars.ARTIFACTORY_ARCHIVE_PREFIX || 'duckdb-rs' }}
+        run: python3 scripts/archive_artifacts.py --run-id "$SOURCE_RUN_ID"

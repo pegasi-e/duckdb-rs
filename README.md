@@ -55,6 +55,31 @@ patching both crates to local paths or configuring a private registry. Prefer
 the Git dependency or complete source workspace for applications.
 Rust `.rlib` files are compiler/target specific and are not portable SDKs.
 
+To archive these existing ZIPs in Artifactory, use the **Archive build ZIPs**
+manual workflow (`release.yaml`) and enter a successful Bundled fork run ID.
+The default is the verified four-platform run `40962050450`. This workflow
+downloads the original GitHub ZIP bytes without extracting or repackaging them,
+checks their SHA-256 digests and shared DuckDB provenance, then uploads them to:
+
+```text
+https://gart.software.gevernova.com/artifactory/data-fabric-generic/duckdb-rs/<commit>/run-<id>/attempt-<n>/
+```
+
+Add repository Actions secret `ARTIFACTORY_ACCESS_TOKEN` directly in GitHub,
+using a token with deploy access to that Generic repository. Do not put the
+token in source files or workflow inputs. The optional repository variables
+`ARTIFACTORY_BASE_URL`, `ARTIFACTORY_GENERIC_REPOSITORY`, and
+`ARTIFACTORY_ARCHIVE_PREFIX` override the defaults above.
+
+Select `dry_run` to verify the downloads and generate an archive manifest and
+`SHA256SUMS` without credentials or Artifactory uploads. A normal run uploads
+all four ZIPs, followed by that manifest and checksum file. No Cargo registry
+publishing or crate version changes are involved. For local verification:
+
+```sh
+python3 scripts/archive_artifacts.py --run-id 40962050450 --dry-run
+```
+
 ---
 
 # duckdb-rs
