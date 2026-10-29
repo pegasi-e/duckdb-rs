@@ -745,8 +745,8 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invalid-utf8.csv");
         let mut contents = b"value\n".to_vec();
-        contents.extend(b"valid\n".repeat(4096));
         contents.extend_from_slice(b"invalid\xff\n");
+        contents.extend(b"valid\n".repeat(4096));
         std::fs::write(&path, contents).unwrap();
 
         let db = Connection::open_in_memory()?;
