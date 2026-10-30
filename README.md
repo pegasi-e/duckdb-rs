@@ -1,3 +1,83 @@
+# Anybase DuckDB Rust bindings
+
+This fork bundles [our DuckDB fork](https://github.com/jeremyosterhoudt/duckdb)
+1.5.6 at `d5adf13edc1d1964573f2e80bb44ccd85f1bb524`, using duckdb-rs
+`1.10503.1` (organization fork commit `7594681`) as the Rust API baseline. Existing Rust wrappers and pregenerated
+FFI bindings are unchanged; custom native APIs are not exposed by this change.
+The crate version remains the upstream Rust API baseline, not the engine version.
+
+Use the Git dependency with `bundled` enabled (pin the resulting Rust fork commit
+with `rev` for reproducible application builds):
+
+```toml
+[dependencies]
+duckdb = { git = "https://github.com/pegasi-e/duckdb-rs", branch = "codex/anybase-bundled", features = ["bundled"] }
+```
+
+For local use, replace `git` and `branch` with
+`path = "/path/to/duckdb-rs/crates/duckdb"`. If a dependency also uses the
+crates.io packages, patch both `duckdb` and `libduckdb-sys` to this repository
+under `[patch.crates-io]` in the application's root manifest.
+
+`bundled` compiles the checked-in `duckdb.tar.gz` and requires a C++ compiler.
+Use `json` and/or `parquet` as usual to include those extensions. Non-bundled
+system-library mode is still supported via `DUCKDB_LIB_DIR`, but setting
+`DUCKDB_DOWNLOAD_LIB=1` is rejected to prevent downloading the upstream engine.
+
+Build and verify on the host platform:
+
+```sh
+cargo build --release --locked -p duckdb --features bundled
+cargo run --release --locked -p duckdb --example fork_smoke --features bundled
+cargo test --release --locked -p libduckdb-sys --features bundled
+```
+
+Upstream sync policy: this branch remains a DuckDB 1.5 compatibility line.
+Upstream `main` now targets a 2.0 preview, including `duckdb-neo`, v2 C bindings,
+and new C API calls unavailable in our engine. Those changes are not built or
+published here. We retain the existing 1.10503.1 Rust API and selectively carry
+compatible fixes and dependency updates. The upstream sync at `a7acfc4` is
+reconciled without upgrading the engine or exposing the Anybase-specific C API.
+Run `python3 scripts/check_fork_compat.py` to check the bundle, provenance and
+native binding declarations before a build.
+
+To regenerate the source bundle, update the submodule and `duckdb-fork.json`
+together, then run `./upgrade.sh`. This preserves the public Rust bindings.
+The source commit must match the pin and have no tracked modifications.
+The bundle checksum is recorded in `duckdb.tar.gz.sha256`.
+
+CI builds bundled crates on Linux x86-64 and ARM64, macOS, and Windows. It uploads
+Cargo packages, the complete source workspace, and the host smoke executable. Extract the source
+workspace archive to use the local `path` dependency shown above; it retains the
+internal path dependencies so the engine stays on this fork. Individual `.crate`
+files retain upstream names and versions: consuming them separately requires
+patching both crates to local paths or configuring a private registry. Prefer
+the Git dependency or complete source workspace for applications.
+Rust `.rlib` files are compiler/target specific and are not portable SDKs.
+
+After **Bundled fork** completes successfully, the separate **Prepare manual
+upload** workflow (`release.yaml`) collects all four platform artifact ZIPs.
+It verifies their SHA-256 digests and shared DuckDB provenance, then uploads a
+single GitHub Actions artifact named
+`duckdb-rs-manual-upload-<source-run-id>-attempt-<n>`.
+
+Download that artifact ZIP and upload it manually to your Artifactory Generic
+repository. It contains the four original platform ZIPs unchanged, plus
+`archive-manifest.json` and `SHA256SUMS`. No Artifactory credentials, connection,
+Cargo registry publishing, or crate version changes are involved.
+
+GitHub enables the automatic `workflow_run` trigger once this workflow is on
+the default branch (`main`). Failed or cancelled native builds do not produce
+a manual-upload bundle. The packaging workflow also supports a manual
+`workflow_dispatch` trigger with a successful native build run ID, including
+existing run `40962050450`. Local preparation uses GitHub CLI authentication:
+
+```sh
+python3 scripts/prepare_upload_artifact.py --run-id 40962050450
+```
+
+---
+
 # duckdb-rs
 
 [![Latest Version](https://img.shields.io/crates/v/duckdb.svg)](https://crates.io/crates/duckdb)
@@ -74,79 +154,19 @@ fn main() -> Result<()> {
 
 Execute the program with `cargo run` and watch DuckDB in action!
 
-### duckdb-neo: the v2 C API wrapper (experimental)
-
-> ⚠ DuckDB's v2 C API is in rapid development. Consider `duckdb-neo` unstable. Feedback is welcome!
-
-`duckdb-neo` is a second wrapper crate in this repository that targets DuckDB's new v2 C API (`duckdb_v2.h`) instead of the v1 API used by `duckdb`. Both crates share the same `libduckdb-sys` crate and therefore the same bundled DuckDB, build options, and version number.
-
-```shell
-cargo add duckdb-neo
-```
-
-```rust,ignore
-use duckdb_neo::{
-    Parameters,
-    environment::{Environment, StorageLocation},
-};
-
-fn main() -> duckdb_neo::Result<()> {
-    let environment = Environment::new()?;
-    let database = environment.open(StorageLocation::InMemory)?;
-    let connection = database.connect()?;
-
-    let mut result = connection.query("SELECT $1::INTEGER", Parameters::positional(&[&42]))?;
-    let chunk = result.next_chunk()?.expect("query returned no rows");
-    let values = chunk.get_vector_at::<i32>(0)?;
-    assert_eq!(values.get(0)?, Some(&42));
-    Ok(())
-}
-```
-
-`libduckdb-sys` exposes the v1 bindings as `libduckdb_sys::v1` (also re-exported at the crate root) behind the default `capi-v1` feature, and the v2 bindings as `libduckdb_sys::v2` behind its `capi-v2` feature. `duckdb-neo` disables the default features and enables `capi-v2`, so only the v2 bindings are generated.
-
-To write DuckDB extensions with `duckdb-neo`, loadable or statically linked, see [crates/duckdb-neo/extensions.md](crates/duckdb-neo/extensions.md).
-
 ## Examples
 
 The following [examples](crates/duckdb/examples) demonstrate various features and use cases of duckdb-rs:
 
 - **basic** - Basic usage including creating tables, inserting data, and querying with and without Arrow.
 - **appender** - Bulk data insertion using the appender API with transactions.
-- **arrow_vtab** - Querying an in-memory Arrow RecordBatch from DuckDB SQL (requires the `vtab-arrow` feature).
 - **parquet** - Reading Parquet files directly using DuckDB's Parquet extension.
 - **vscalar** - Defining and registering a custom scalar function (requires the `vscalar` feature).
 - **vtab** - Defining a custom table function returning primitive, LIST, and STRUCT columns (requires the `vtab` feature).
 - **repl** - Interactive SQL REPL.
 - **hello-ext** - A DuckDB extension written in Rust (see [Building and loading extensions](#building-and-loading-extensions)).
 
-Run an executable example using your configured DuckDB library:
-
-```shell
-cargo run --example basic
-```
-
-Pass each example's required feature when applicable:
-
-```shell
-cargo run --example arrow_vtab --features vtab-arrow
-cargo run --example vscalar --features vscalar
-cargo run --example vtab --features vtab
-cargo run --example parquet --features parquet
-```
-
-Without `bundled`, the build links against the pinned prebuilt DuckDB it downloads (or a system library, see [Notes on building](#notes-on-building-duckdb-and-libduckdb-sys)). To compile DuckDB from source instead, add `bundled` to the feature list. For example:
-
-```shell
-cargo run --example basic --features bundled
-cargo run --example arrow_vtab --features "bundled vtab-arrow"
-```
-
-`hello-ext` is a library target rather than an executable, so build it instead of using `cargo run`:
-
-```shell
-cargo build --example hello-ext --features loadable-extension
-```
+Run any example with `cargo run --example <name>`.
 
 ## Feature flags
 
@@ -158,7 +178,7 @@ The `duckdb` crate provides a number of Cargo features that can be enabled to ad
 - `vtab-arrow` - Apache Arrow integration for virtual tables. Enables conversion between Arrow RecordBatch and DuckDB data chunks.
 - `vtab-excel` - Deprecated no-op retained for feature compatibility.
 - `vscalar` - Create custom scalar functions that operate on individual values or rows.
-- `vscalar-arrow` - Arrow-optimized scalar functions for vectorized operations. Requires `vscalar`.
+- `vscalar-arrow` - Arrow-optimized scalar functions for vectorized operations.
 
 ### File formats
 
@@ -170,7 +190,6 @@ The `duckdb` crate provides a number of Cargo features that can be enabled to ad
 These extensions are only available through the CMake build backend and imply `bundled-cmake`.
 
 - `autocomplete` - DuckDB's autocomplete extension.
-- `httpfs` - Statically links DuckDB's HTTP(S) and S3 filesystem extension (Linux and macOS only).
 - `icu` - DuckDB's ICU extension for locale-aware operations.
 - `tpch` - DuckDB's TPC-H benchmark extension.
 - `tpcds` - DuckDB's TPC-DS benchmark extension.
@@ -179,25 +198,18 @@ These extensions are only available through the CMake build backend and imply `b
 
 - `appender-arrow` - Efficient bulk insertion of Arrow data into DuckDB tables.
 - `polars` - Integration with Polars DataFrames.
-- `rust_decimal` - Compatibility impls for `rust_decimal::Decimal`. DuckDB
-  `DECIMAL` values use `duckdb::types::Decimal` as the core full-domain
-  carrier; this feature restores `ToSql`/`FromSql` conversions for
-  `rust_decimal::Decimal` when values fit that crate's decimal domain,
-  including compatibility reads from `FLOAT`, `DOUBLE`, and text columns.
 
 ### Convenience features
 
 - `vtab-full` - Enables virtual table features: `vtab-arrow` and `appender-arrow`; retains the deprecated `vtab-excel` compatibility flag.
 - `extensions-full` - Enables all major extensions: `json`, `parquet`, and `vtab-full`.
-- `modern-full` - Enables modern Rust ecosystem integrations: `chrono`, `serde_json`, `url`, `r2d2`, `uuid`, `polars`, and `rust_decimal`.
+- `modern-full` - Enables modern Rust ecosystem integrations: `chrono`, `serde_json`, `url`, `r2d2`, `uuid`, and `polars`.
 
 ### Build configuration
 
 - `bundled` - Uses a bundled version of DuckDB's source code and compiles it during build. This is the simplest way to get started and avoids needing DuckDB system libraries.
 - `bundled-cmake` - _Experimental_. Builds DuckDB via its upstream CMake build system instead of `cc`. Requires a duckdb-rs checkout (not available from crates.io). See [step 2](#notes-on-building-duckdb-and-libduckdb-sys) below for details.
 - `buildtime_bindgen` - Use bindgen at build time to generate fresh bindings instead of using pre-generated ones.
-- `capi-v1` (`libduckdb-sys` only, default) - Generate bindings for the v1 C API header `duckdb.h`, exposed as `libduckdb_sys::v1` and at the crate root. Required by `duckdb` and by `loadable-extension`.
-- `capi-v2` (`libduckdb-sys` only) - Also generate bindings for the v2 C API header `duckdb_v2.h`, exposed as `libduckdb_sys::v2`. `duckdb-neo` enables this automatically. With `buildtime_bindgen`, `duckdb_v2.h` must sit next to `duckdb.h` in `DUCKDB_INCLUDE_DIR`.
 - `loadable-extension` - _Experimental_ support for creating loadable DuckDB extensions. Includes procedural macros for extension development. Only enable this when building an extension, never for a client application - see [Database client or extension?](#database-client-or-extension)
 
 ## Installation
@@ -220,7 +232,7 @@ Or manually add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-duckdb = { version = "~1.20000.1", features = ["bundled"] }
+duckdb = { version = "~1.10503.1", features = ["bundled"] }
 ```
 
 ### Using the development version from git
@@ -236,7 +248,6 @@ duckdb = { git = "https://github.com/duckdb/duckdb-rs", rev = "abc123def", featu
 ```
 
 Note: Using the main branch of duckdb-rs means you'll get the latest Rust bindings and features, but you'll still be using whatever version of DuckDB core is bundled with that commit (when using the `bundled` feature).
-Use the `v1.4-andium` branch for LTS releases that stay on DuckDB 1.4 Andium.
 
 ## Notes on building duckdb and libduckdb-sys
 
@@ -260,10 +271,10 @@ You can adjust this behavior in a number of ways:
 
    ```toml
    [dependencies]
-   duckdb = { version = "~1.20000.1", features = ["bundled"] }
+   duckdb = { version = "~1.10503.1", features = ["bundled"] }
    ```
 
-2. If you use the `bundled-cmake` feature, `libduckdb-sys` will build DuckDB from the local checkout in `crates/libduckdb-sys/duckdb-sources` using upstream CMake. This keeps plain `bundled` unchanged while allowing CMake-only extensions such as `httpfs` and `icu`.
+2. If you use the `bundled-cmake` feature, `libduckdb-sys` will build DuckDB from the local checkout in `crates/libduckdb-sys/duckdb-sources` using upstream CMake. This keeps plain `bundled` unchanged while allowing CMake-only extensions such as `icu`.
 
    Example:
 
@@ -280,21 +291,16 @@ You can adjust this behavior in a number of ways:
    - Extension autoload/autoinstall are enabled to match `bundled`, despite upstream CMake defaults. Set `DUCKDB_DISABLE_EXTENSION_LOAD=1` or `DISABLE_EXTENSION_LOAD=1` to disable external extension install/load support and force autoload/autoinstall off. Statically linked extensions remain available.
    - If `ninja` is on `PATH`, the build uses Ninja by default. Set `CMAKE_GENERATOR` to override.
    - DuckDB builds in `Release` mode by default, even for Rust debug builds, avoiding DuckDB's much slower debug/sanitizer profile. Override with `DUCKDB_CMAKE_BUILD_TYPE` or `CMAKE_BUILD_TYPE`. `DUCKDB_CMAKE_BUILD_TYPE` takes precedence.
-   - `httpfs` requires CMake, a C++ compiler, pkg-config, and the libcurl and OpenSSL development libraries. On Debian/Ubuntu, install `cmake pkg-config libcurl4-openssl-dev libssl-dev`; on macOS, install `cmake pkg-config openssl@3` with Homebrew (the macOS SDK provides libcurl). OpenSSL must be discoverable through pkg-config; for a custom installation, set `PKG_CONFIG_PATH` to its `lib/pkgconfig` directory. Network access is required at CMake configure time to fetch the HTTPFS extension sources. Windows is currently unsupported for `httpfs`. Once built, `LOAD httpfs` needs no downloaded extension artifact, including when external extension loading is disabled.
    - `DUCKDB_EXTENSION_CONFIGS` is unsupported. Setting it fails fast.
    - Use `cargo build -vv -F bundled-cmake` for CMake configure/build logs.
-   - On Windows (MSVC), keep the Cargo target directory short (e.g. `CARGO_TARGET_DIR=D:/t`). DuckDB's unity build includes sources by a path relative to the build directory, and deep paths exceed MSVC's 260-character limit with `C1083`. Alternatively set `DUCKDB_DISABLE_UNITY=1`.
 
-3. When linking against a DuckDB library already on the system (so _not_ using any of the `bundled` features), you can set the `DUCKDB_LIB_DIR` environment variable to point to a directory containing the library. You can also set the `DUCKDB_INCLUDE_DIR` variable to point to the directory containing `duckdb.h` (and `duckdb_v2.h` when using `capi-v2` with `buildtime_bindgen`).
+3. When linking against a DuckDB library already on the system (so _not_ using any of the `bundled` features), you can set the `DUCKDB_LIB_DIR` environment variable to point to a directory containing the library. You can also set the `DUCKDB_INCLUDE_DIR` variable to point to the directory containing `duckdb.h`.
 
-   The examples below fetch the same prebuilt build the crate pins in `crates/libduckdb-sys/.duckdb-release` (see step 4). Once DuckDB publishes the v2.0.0 release, its `duckdb-shared-libs-<platform>.tar.gz` assets on GitHub Releases work the same way. Each archive is a flat tarball with the shared library and the public headers.
-
-   Linux ARM64 example:
+   Linux example:
 
    ```shell
-   source crates/libduckdb-sys/.duckdb-release   # sets DUCKDB_RELEASE_URL
-   mkdir libduckdb
-   curl -fL "$DUCKDB_RELEASE_URL/duckdb-shared-libs-linux-arm64.tar.gz" | tar -xz -C libduckdb
+   wget https://github.com/duckdb/duckdb/releases/download/v1.5.3/libduckdb-linux-arm64.zip
+   unzip libduckdb-linux-arm64.zip -d libduckdb
 
    export DUCKDB_LIB_DIR=$PWD/libduckdb
    export DUCKDB_INCLUDE_DIR=$DUCKDB_LIB_DIR
@@ -303,14 +309,11 @@ You can adjust this behavior in a number of ways:
    cargo build --examples
    ```
 
-   For x86-64 Linux, replace `arm64` with `amd64` in the archive name.
-
    macOS example:
 
    ```shell
-   source crates/libduckdb-sys/.duckdb-release   # sets DUCKDB_RELEASE_URL
-   mkdir libduckdb
-   curl -fL "$DUCKDB_RELEASE_URL/duckdb-shared-libs-osx-universal.tar.gz" | tar -xz -C libduckdb
+   wget https://github.com/duckdb/duckdb/releases/download/v1.5.3/libduckdb-osx-universal.zip
+   unzip libduckdb-osx-universal.zip -d libduckdb
 
    export DUCKDB_LIB_DIR=$PWD/libduckdb
    export DUCKDB_INCLUDE_DIR=$DUCKDB_LIB_DIR
@@ -319,26 +322,17 @@ You can adjust this behavior in a number of ways:
    cargo build --examples
    ```
 
-   On Windows the `windows-amd64` and `windows-arm64` archives contain `duckdb.dll` and its `duckdb.lib` import library; put both in `DUCKDB_LIB_DIR` and add that directory to `PATH`.
-
-4. When none of the `bundled` features is enabled and `DUCKDB_LIB_DIR` is not set, the build script downloads pre-built DuckDB binaries and links against the dynamic library in the archive, effectively automating the manual steps above. Which build it downloads is pinned in `crates/libduckdb-sys/.duckdb-release`: a `DUCKDB_RELEASE_URL` directory holding the `duckdb-shared-libs-<platform>.tar.gz` archives, currently a staging build of a v2.0.0 preview commit, plus a `DUCKDB_RELEASE_VERSION` label and the `DUCKDB_RELEASE_COMMIT` those libraries were built from. `./upgrade.sh --sync` vendors that same commit into the bundled sources, so `bundled` and the download always agree. Without a pin file the build falls back to the GitHub release matching the DuckDB version encoded in the crate version.
-
-   Set `DUCKDB_DOWNLOAD_LIB=0` to opt out and probe the system (vcpkg, pkg-config) instead, or `DUCKDB_DOWNLOAD_LIB=1` to force the download. Leave `DUCKDB_STATIC` unset: setting it requests a static `duckdb_static` library, which the downloaded archives do not contain. The archives are cached in `target/duckdb-download/<target>/<version>` and that directory is automatically added to the linker search path.
+4. Setting `DUCKDB_DOWNLOAD_LIB=1` makes the build script download pre-built DuckDB binaries from GitHub Releases. This always links against the dynamic library in the archive (setting `DUCKDB_STATIC` has no effect), and it effectively automates the manual steps above. The archives are cached in `target/duckdb-download/<target>/<version>` and that directory is automatically added to the linker search path. The downloaded version always matches the DuckDB version encoded in the `libduckdb-sys` crate version.
 
    ```shell
-   cargo test                          # downloads the pinned build on first use
-   DUCKDB_DOWNLOAD_LIB=0 cargo test    # use a system DuckDB instead
+   DUCKDB_DOWNLOAD_LIB=1 cargo test
    ```
-
-   The download needs the `download-lib` feature, which pulls an HTTP client (`ureq`/`rustls`) into the build script. It is on by default; consumers building with `bundled` or a system DuckDB can drop it (and the HTTP client) with `default-features = false`, in which case the build probes the system unless `DUCKDB_DOWNLOAD_LIB=1` is set explicitly.
-
-   The pinned staging archives do not ship `duckdb_v2.h` yet, so `buildtime_bindgen` together with `capi-v2` needs `DUCKDB_INCLUDE_DIR` or a `bundled` build until the pin moves to a newer DuckDB build.
 
 5. Installing the DuckDB development packages will usually be all that is required, but
    the build helpers for [pkg-config](https://github.com/alexcrichton/pkg-config-rs)
    and [vcpkg](https://github.com/mcgoo/vcpkg-rs) have some additional configuration
-   options. `vcpkg-rs` uses static libraries by default. To opt into dynamic
-   linking, set the `VCPKGRS_DYNAMIC=1` environment variable before building.
+   options. The default when using vcpkg is to dynamically link,
+   which must be enabled by setting `VCPKGRS_DYNAMIC=1` environment variable before build.
 
 When none of the options above are used, the build script falls back to this discovery path and will emit the appropriate `cargo:rustc-link-lib` directives if DuckDB is found on your system.
 
@@ -376,10 +370,6 @@ pregenerated bindings for DuckDB.
 If you use the `bundled` feature, you will get pregenerated bindings for the
 bundled version of DuckDB. If you want to run `bindgen` at build time to
 produce your own bindings, use the `buildtime_bindgen` Cargo feature.
-
-Three pregenerated files ship with `libduckdb-sys`: the v1 bindings, the
-v1 loadable-extension bindings, and (for `capi-v2`) the v2 bindings. The
-`upgrade.sh` script regenerates all of them.
 
 ## Thread safety
 

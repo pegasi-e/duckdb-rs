@@ -3,16 +3,12 @@ use std::{convert, ffi::c_void, fmt, mem, os::raw::c_char, ptr, str};
 use arrow::{array::StructArray, datatypes::SchemaRef};
 
 use super::{AndThenRows, Connection, Error, MappedRows, Params, RawStatement, Result, Row, Rows, ValueRef, ffi};
-use crate::core::LogicalTypeId;
 #[cfg(feature = "polars")]
 use crate::polars_dataframe::Polars;
 use crate::{
     arrow_batch::{Arrow, ArrowStream},
     error::result_from_duckdb_prepare,
-    types::{
-        ToSql, ToSqlOutput, binding_unsupported_value, create_owned_container, is_owned_container, to_duckdb_hugeint,
-        to_duckdb_uhugeint, value_ref_from_value,
-    },
+    types::{ToSql, ToSqlOutput, binding_unsupported_value, value_ref_from_value},
 };
 #[cfg(feature = "polars")]
 use polars_core::utils::arrow as polars_arrow;
@@ -104,10 +100,6 @@ impl Statement<'_> {
     /// Execute the prepared statement, returning a handle to the resulting
     /// vector of arrow RecordBatch
     ///
-    /// The result is fully materialized on execution, so memory usage is
-    /// proportional to the size of the result set. For large results, see
-    /// [`stream_arrow`](Self::stream_arrow).
-    ///
     /// ## Example
     ///
     /// ```rust,no_run
@@ -120,8 +112,7 @@ impl Statement<'_> {
     ///
     /// # Failure
     ///
-    /// Will return `Err` if binding parameters fails, execution fails, or
-    /// DuckDB reports unsupported executed-result metadata.
+    /// Will return `Err` if binding parameters fails.
     #[inline]
     pub fn query_arrow<P: Params>(&mut self, params: P) -> Result<Arrow<'_>> {
         self.execute(params)?;
@@ -131,32 +122,25 @@ impl Statement<'_> {
     /// Execute the prepared statement, returning a handle to the resulting
     /// vector of arrow RecordBatch in streaming way
     ///
-    /// Unlike [`query_arrow`](Self::query_arrow), chunks are fetched lazily
-    /// as the iterator is consumed instead of buffering the full result on
-    /// the client side. Note that DuckDB may still materialize the result
-    /// internally for some statements (e.g. CALL). The schema is available
-    /// via [`Arrow::get_schema`].
-    ///
     /// ## Example
     ///
     /// ```rust,no_run
     /// # use duckdb::{Result, Connection};
     /// # use arrow::record_batch::RecordBatch;
-    /// fn get_arrow_data(conn: &Connection) -> Result<Vec<RecordBatch>> {
-    ///     conn.prepare("SELECT * FROM test")?.stream_arrow([])?.collect()
+    /// # use arrow::datatypes::SchemaRef;
+    /// fn get_arrow_data(conn: &Connection, schema: SchemaRef) -> Result<Vec<RecordBatch>> {
+    ///     Ok(conn.prepare("SELECT * FROM test")?.stream_arrow([], schema)?.collect())
     /// }
     /// ```
     ///
     /// # Failure
     ///
-    /// Same failure modes as [`query_arrow`](Self::query_arrow). Fetch and
-    /// Arrow conversion errors after execution has started are yielded as
-    /// [`Err`] items.
+    /// Will return `Err` if binding parameters fails.
     #[inline]
-    pub fn stream_arrow<P: Params>(&mut self, params: P) -> Result<ArrowStream<'_>> {
+    pub fn stream_arrow<P: Params>(&mut self, params: P, schema: SchemaRef) -> Result<ArrowStream<'_>> {
         params.__bind_in(self)?;
         self.stmt.execute_streaming()?;
-        Ok(ArrowStream::new(self))
+        Ok(ArrowStream::new(self, schema))
     }
 
     /// Execute the prepared statement, returning a handle to the resulting
@@ -244,8 +228,7 @@ impl Statement<'_> {
     /// }
     /// ```
     ///
-    /// Or, equivalently (but without the [`duckdb::params!`](crate::params!)
-    /// macro).
+    /// Or, equivalently (but without the [`params!`] macro).
     ///
     /// ```rust,no_run
     /// # use duckdb::{Connection, Result};
@@ -409,18 +392,21 @@ impl Statement<'_> {
         self.stmt.row_count()
     }
 
-    /// Get next batch records in arrow-rs.
-    ///
-    /// Returns `Err` if DuckDB cannot fetch the next result chunk or convert
-    /// it to Arrow.
+    /// Get next batch records in arrow-rs
     #[inline]
-    pub fn step(&self) -> Result<Option<StructArray>> {
+    pub fn step(&self) -> Option<StructArray> {
         self.stmt.step()
+    }
+
+    /// Get next batch records in arrow-rs in a streaming way
+    #[inline]
+    pub fn stream_step(&self, schema: SchemaRef) -> Option<StructArray> {
+        self.stmt.streaming_step(schema)
     }
 
     #[cfg(feature = "polars")]
     #[inline]
-    pub(crate) fn step_polars(&self) -> Result<Option<polars_arrow::array::StructArray>> {
+    pub(crate) fn step_polars(&self) -> Option<polars_arrow::array::StructArray> {
         self.stmt.step_polars()
     }
 
@@ -586,24 +572,11 @@ impl Statement<'_> {
         self.stmt.schema()
     }
 
-    #[inline]
-    pub(crate) fn result_column_logical_id(&self, idx: usize) -> Option<LogicalTypeId> {
-        self.stmt.result_column_logical_id(idx)
-    }
-
     // generic because many of these branches can constant fold away.
     fn bind_parameter<P: ?Sized + ToSql>(&self, param: &P, col: usize) -> Result<()> {
         let value = param.to_sql()?;
 
         let ptr = unsafe { self.stmt.ptr() };
-        if let ToSqlOutput::Owned(ref owned) = value
-            && is_owned_container(owned)
-        {
-            let duck_value = create_owned_container(owned)?;
-            let rc = unsafe { ffi::duckdb_bind_value(ptr, col as u64, duck_value.as_raw()) };
-            drop(duck_value);
-            return result_from_duckdb_prepare(rc, ptr);
-        }
         let value = match value {
             ToSqlOutput::Borrowed(v) => v,
             ToSqlOutput::Owned(ref v) => value_ref_from_value(v, binding_unsupported_value)?,
@@ -616,8 +589,13 @@ impl Statement<'_> {
             ValueRef::SmallInt(i) => unsafe { ffi::duckdb_bind_int16(ptr, col as u64, i) },
             ValueRef::Int(i) => unsafe { ffi::duckdb_bind_int32(ptr, col as u64, i) },
             ValueRef::BigInt(i) => unsafe { ffi::duckdb_bind_int64(ptr, col as u64, i) },
-            ValueRef::HugeInt(i) => unsafe { ffi::duckdb_bind_hugeint(ptr, col as u64, to_duckdb_hugeint(i)) },
-            ValueRef::UHugeInt(i) => unsafe { ffi::duckdb_bind_uhugeint(ptr, col as u64, to_duckdb_uhugeint(i)) },
+            ValueRef::HugeInt(i) => unsafe {
+                let hi = ffi::duckdb_hugeint {
+                    lower: i as u64,
+                    upper: (i >> 64) as i64,
+                };
+                ffi::duckdb_bind_hugeint(ptr, col as u64, hi)
+            },
             ValueRef::UTinyInt(i) => unsafe { ffi::duckdb_bind_uint8(ptr, col as u64, i) },
             ValueRef::USmallInt(i) => unsafe { ffi::duckdb_bind_uint16(ptr, col as u64, i) },
             ValueRef::UInt(i) => unsafe { ffi::duckdb_bind_uint32(ptr, col as u64, i) },
@@ -627,7 +605,7 @@ impl Statement<'_> {
             ValueRef::Text(s) => unsafe {
                 ffi::duckdb_bind_varchar_length(ptr, col as u64, s.as_ptr() as *const c_char, s.len() as u64)
             },
-            ValueRef::Blob(b) | ValueRef::Geometry(b) => unsafe {
+            ValueRef::Blob(b) => unsafe {
                 ffi::duckdb_bind_blob(ptr, col as u64, b.as_ptr() as *const c_void, b.len() as u64)
             },
             ValueRef::Timestamp(u, i) => unsafe {
@@ -694,18 +672,15 @@ impl Statement<'_> {
 
 #[cfg(test)]
 mod test {
-    use arrow::{
-        array::ListArray,
-        datatypes::{DataType, Int32Type, Schema, SchemaRef},
-        record_batch::RecordBatch,
-    };
+    use arrow::{array::ListArray, datatypes::Int32Type};
 
     use crate::{
-        Connection, Error, Result, Statement,
-        core::{LogicalTypeId, RawLogicalTypeId},
+        Connection, Error, Result,
+        core::LogicalTypeId,
         params_from_iter,
-        types::{Decimal, ListType, OrderedMap, ToSql, ToSqlOutput, Type, Value, ValueRef},
+        types::{ListType, ToSql, ToSqlOutput, Type, ValueRef},
     };
+    use rust_decimal::Decimal;
 
     struct BorrowedList(ListArray);
     impl BorrowedList {
@@ -798,24 +773,6 @@ mod test {
             let id: i32 = stmt.query_one([&"one"], |r| r.get(0))?;
             assert_eq!(id, 1);
         }
-        Ok(())
-    }
-
-    #[test]
-    fn test_bind_u128_as_uhugeint() -> Result<()> {
-        const U128_MAX_SQL: &str = "340282366920938463463374607431768211455";
-
-        let db = Connection::open_in_memory()?;
-        let max = u128::MAX;
-
-        let typ: String = db.query_row("SELECT typeof(?)", [&max], |row| row.get(0))?;
-        assert_eq!(typ, "UHUGEINT");
-
-        let equals_max: bool = db.query_row(&format!("SELECT ? = ({U128_MAX_SQL})::UHUGEINT"), [&max], |row| {
-            row.get(0)
-        })?;
-        assert!(equals_max);
-
         Ok(())
     }
 
@@ -1175,7 +1132,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "The statement was not executed yet")]
+    #[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
     fn test_unexecuted_schema_panics() {
         let db = Connection::open_in_memory().unwrap();
         let sql = "BEGIN;
@@ -1598,13 +1555,12 @@ mod test {
     fn test_execute_streaming_error_message() -> Result<()> {
         let db = Connection::open_in_memory()?;
 
-        // Trigger a conversion error - should fail with a descriptive message.
-        // Newer DuckDB versions defer the error from execute to the first fetch.
+        // Trigger a conversion error - should fail with a descriptive message
         let mut stmt = db.prepare("SELECT CAST('not-a-number' AS INTEGER)")?;
-        let err = match stmt.stmt.execute_streaming() {
-            Err(e) => e,
-            Ok(()) => stmt.stmt.step().expect_err("expected conversion error on first fetch"),
-        };
+        let result = stmt.stmt.execute_streaming();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
 
         let error_string = format!("{}", err);
         assert!(
@@ -1612,228 +1568,6 @@ mod test {
             "Expected descriptive error, got: {}",
             error_string
         );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_step_after_streaming_materialized_result_fetches_data() -> Result<()> {
-        use arrow::array::Int32Array;
-
-        let db = Connection::open_in_memory()?;
-        db.execute_batch(
-            "CREATE TABLE test_data(id INTEGER);
-             INSERT INTO test_data VALUES (1), (2);
-             CREATE MACRO test_func() AS TABLE SELECT * FROM test_data;",
-        )?;
-
-        let mut stmt = db.prepare("CALL test_func()")?;
-        stmt.stmt.execute_streaming()?;
-
-        let batch = stmt.stmt.step()?.expect("expected result batch");
-        let values = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(1, values.value(0));
-        Ok(())
-    }
-
-    #[test]
-    fn test_row_count_after_query_execution() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let mut stmt = db.prepare("SELECT i FROM range(3000) AS t(i)")?;
-        {
-            let rows = stmt.query([])?;
-            drop(rows);
-        }
-
-        assert_eq!(3000, stmt.row_count());
-        Ok(())
-    }
-
-    #[test]
-    fn test_stream_arrow_large_result() -> Result<()> {
-        use arrow::array::Int64Array;
-
-        let db = Connection::open_in_memory()?;
-        let mut stmt = db.prepare("SELECT i FROM range(3000) AS t(i) ORDER BY i")?;
-        let mut stream = stmt.stream_arrow([])?;
-        let batches = stream.by_ref().collect::<Result<Vec<_>>>()?;
-
-        assert!(batches.len() > 1);
-        assert_eq!(3000, batches.iter().map(|batch| batch.num_rows()).sum::<usize>());
-
-        let values = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .iter()
-                    .map(Option::unwrap)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(0, values[0]);
-        assert_eq!(2048, values[2048]);
-        assert_eq!(2999, values[2999]);
-        assert!(stream.next().is_none());
-        assert!(stream.next().is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_stream_arrow_with_params() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let mut stmt = db.prepare("SELECT i FROM range(3000) AS t(i) WHERE i < ? ORDER BY i")?;
-        let batches = stmt.stream_arrow([2500_i64])?.collect::<Result<Vec<_>>>()?;
-
-        assert!(batches.len() > 1);
-        assert_eq!(2500, batches.iter().map(|batch| batch.num_rows()).sum::<usize>());
-        Ok(())
-    }
-
-    const ARROW_EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
-    const UUID_EXTENSION_NAME: &str = "arrow.uuid";
-    const UUID_BYTE_WIDTH: i32 = 16;
-
-    fn assert_default_uuid_arrow_schema(schema: &Schema) {
-        let field = schema.field(0);
-        assert_eq!(field.name(), "id");
-        assert_eq!(field.data_type(), &DataType::Utf8);
-        assert!(
-            !field.metadata().contains_key(ARROW_EXTENSION_NAME_KEY),
-            "default UUID Arrow export should not carry extension metadata"
-        );
-    }
-
-    fn assert_lossless_uuid_arrow_schema(schema: &Schema) {
-        let field = schema.field(0);
-        assert_eq!(field.name(), "id");
-        assert_eq!(field.data_type(), &DataType::FixedSizeBinary(UUID_BYTE_WIDTH));
-        assert_eq!(
-            field.metadata().get(ARROW_EXTENSION_NAME_KEY).map(String::as_str),
-            Some(UUID_EXTENSION_NAME)
-        );
-    }
-
-    fn check_uuid_arrow_schemas(query: impl Fn(&mut Statement<'_>) -> Result<(SchemaRef, RecordBatch)>) -> Result<()> {
-        for lossless in [false, true] {
-            let db = Connection::open_in_memory()?;
-            if lossless {
-                db.execute_batch("SET arrow_lossless_conversion = true")?;
-            }
-            let assert_schema: fn(&Schema) = if lossless {
-                assert_lossless_uuid_arrow_schema
-            } else {
-                assert_default_uuid_arrow_schema
-            };
-
-            let mut stmt = db.prepare("SELECT 'a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8'::UUID AS id")?;
-            let (schema, batch) = query(&mut stmt)?;
-            assert_schema(schema.as_ref());
-            assert_schema(batch.schema().as_ref());
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_query_arrow_uuid_schema_with_and_without_lossless_conversion() -> Result<()> {
-        check_uuid_arrow_schemas(|stmt| {
-            let arrow = stmt.query_arrow([])?;
-            let schema = arrow.get_schema();
-            let batch = arrow.into_iter().next().expect("expected one batch");
-            Ok((schema, batch))
-        })
-    }
-
-    #[test]
-    fn test_stream_arrow_uuid_schema_with_and_without_lossless_conversion() -> Result<()> {
-        check_uuid_arrow_schemas(|stmt| {
-            let stream = stmt.stream_arrow([])?;
-            let schema = stream.get_schema();
-            let batch = stream.into_iter().next().expect("expected one batch")?;
-            Ok((schema, batch))
-        })
-    }
-
-    #[test]
-    fn test_streaming_step_surfaces_fetch_error_after_interrupt() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let interrupt = db.interrupt_handle();
-        let mut stmt = db.prepare("SELECT i FROM range(100000000) AS t(i)")?;
-
-        stmt.stmt.execute_streaming()?;
-        assert!(stmt.stmt.step()?.is_some());
-        interrupt.interrupt();
-
-        let err = stmt.stmt.step().unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("Interrupted"),
-            "expected interrupted fetch error, got: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_stream_arrow_empty_result_reaches_clean_eof() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let mut stmt = db.prepare("SELECT 1 AS x WHERE false")?;
-        let mut stream = stmt.stream_arrow([])?;
-
-        let schema = stream.get_schema();
-        assert_eq!(1, schema.fields().len());
-        assert_eq!("x", schema.field(0).name());
-        assert_eq!(&arrow::datatypes::DataType::Int32, schema.field(0).data_type());
-        assert!(stream.next().is_none());
-        assert!(stream.next().is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn test_stream_arrow_then_query_arrow_replaces_result() -> Result<()> {
-        use arrow::array::Int64Array;
-
-        fn assert_range_batches(batches: &[arrow::record_batch::RecordBatch]) {
-            assert!(batches.len() > 1);
-            assert_eq!(3000, batches.iter().map(|batch| batch.num_rows()).sum::<usize>());
-
-            let values = batches
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .iter()
-                        .map(Option::unwrap)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(0, values[0]);
-            assert_eq!(2048, values[2048]);
-            assert_eq!(2999, values[2999]);
-        }
-
-        let db = Connection::open_in_memory()?;
-        let mut stmt = db.prepare("SELECT i FROM range(3000) AS t(i) ORDER BY i")?;
-
-        {
-            let batches = stmt.stream_arrow([])?.collect::<Result<Vec<_>>>()?;
-            assert_range_batches(&batches);
-        }
-
-        {
-            let batches = stmt.query_arrow([])?.collect::<Vec<_>>();
-            assert_range_batches(&batches);
-        }
-
-        {
-            let batches = stmt.stream_arrow([])?.collect::<Result<Vec<_>>>()?;
-            assert_range_batches(&batches);
-        }
 
         Ok(())
     }
@@ -1970,73 +1704,45 @@ mod test {
             COMMIT;",
         )?;
 
-        // If DuckDB's scale matches the value scale, the scaled integer is preserved.
-        let value = Decimal::new(18, 4, 12345)?;
+        // If duckdb's scale is larger than rust_decimal's scale, value should not be truncated.
+        let value = Decimal::from_i128_with_scale(12345, 4);
         db.execute("INSERT INTO foo(x) VALUES (?)", [&value])?;
         let row: Decimal = db.query_row("SELECT x FROM foo", [], |r| r.get::<_, Decimal>(0))?;
         assert_eq!(row, value);
 
-        // If DuckDB's scale is smaller than the value scale, DuckDB coerces
-        // 1.2345 to the target DECIMAL(18,2) value.
-        let value = Decimal::new(18, 4, 12345)?;
+        // If duckdb's scale is smaller than rust_decimal's scale, value should be truncated (1.2345 -> 1.23).
+        let value = Decimal::from_i128_with_scale(12345, 4);
         db.execute("INSERT INTO bar(y) VALUES (?)", [&value])?;
         let row: Decimal = db.query_row("SELECT y FROM bar", [], |r| r.get::<_, Decimal>(0))?;
-        assert_eq!(row, Decimal::new(18, 2, 123)?);
+        assert_eq!(row, Decimal::from_i128_with_scale(123, 2));
 
         Ok(())
     }
 
     #[test]
-    fn test_with_native_decimal() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        db.execute_batch("CREATE TABLE foo(x DECIMAL(38, 2));")?;
-
-        let value = Decimal::new(38, 2, 12_345_678_901_234_567_890_123_456_789_012)?;
-        db.execute("INSERT INTO foo(x) VALUES (?)", [&value])?;
-
-        let row: Decimal = db.query_row("SELECT x FROM foo", [], |r| r.get(0))?;
-        assert_eq!(row, value);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_decimal_from_sql_integer() -> Result<()> {
+    fn test_decimal_from_sql_integer_and_float() -> Result<()> {
         let db = Connection::open_in_memory()?;
 
         // FromSql: INTEGER -> Decimal
         let row: Decimal = db.query_row("SELECT 42", [], |r| r.get(0))?;
-        assert_eq!(row, Decimal::new(2, 0, 42)?);
+        assert_eq!(row, Decimal::from(42));
 
         // FromSql: BIGINT -> Decimal
         let row: Decimal = db.query_row("SELECT 9999999999::BIGINT", [], |r| r.get(0))?;
-        assert_eq!(row, Decimal::new(10, 0, 9999999999_i64 as i128)?);
+        assert_eq!(row, Decimal::from(9999999999_i64));
+
+        // FromSql: DOUBLE -> Decimal (inherits float imprecision)
+        let row: Decimal = db.query_row("SELECT 3.14::DOUBLE", [], |r| r.get(0))?;
+        let diff = (row - Decimal::from_str_exact("3.14").unwrap()).abs();
+        assert!(diff < Decimal::from_str_exact("0.0001").unwrap());
+
+        // FromSql: VARCHAR -> Decimal
+        let row: Decimal = db.query_row("SELECT '123.456'::VARCHAR", [], |r| r.get(0))?;
+        assert_eq!(row, Decimal::from_str_exact("123.456").unwrap());
 
         // FromSql: HUGEINT -> Decimal
         let row: Decimal = db.query_row("SELECT 12345678901234567890::HUGEINT", [], |r| r.get(0))?;
-        assert_eq!(row, Decimal::new(20, 0, 12345678901234567890)?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_decimal_from_sql_float_targets_preserve_fraction() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-
-        let row: f64 = db.query_row("SELECT 123.45::DECIMAL(10,2)", [], |r| r.get(0))?;
-        assert!((row - 123.45).abs() < f64::EPSILON);
-
-        let row: f32 = db.query_row("SELECT 0.4::DECIMAL(10,1)", [], |r| r.get(0))?;
-        assert!((row - 0.4).abs() < f32::EPSILON);
-
-        let row: f32 = db.query_row("SELECT -0.4::DECIMAL(10,1)", [], |r| r.get(0))?;
-        assert!((row + 0.4).abs() < f32::EPSILON);
-
-        let row: f64 = db.query_row("SELECT 1.5::DECIMAL(10,1)", [], |r| r.get(0))?;
-        assert!((row - 1.5).abs() < f64::EPSILON);
-
-        let row: f64 = db.query_row("SELECT -1.5::DECIMAL(10,1)", [], |r| r.get(0))?;
-        assert!((row + 1.5).abs() < f64::EPSILON);
+        assert_eq!(row, Decimal::from_i128_with_scale(12345678901234567890, 0));
 
         Ok(())
     }
@@ -2048,41 +1754,9 @@ mod test {
 
         let logical_type = stmt.column_logical_type(0);
         assert_eq!(logical_type.id(), LogicalTypeId::Variant);
-        assert_eq!(
-            logical_type.raw_id(),
-            crate::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARIANT as RawLogicalTypeId
-        );
+        assert_eq!(logical_type.raw_id(), crate::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARIANT);
         assert_eq!(logical_type.num_children(), 0);
         assert_eq!(format!("{logical_type:?}"), "Variant");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_geometry_column_logical_type_metadata() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let stmt = db.prepare("SELECT NULL::GEOMETRY AS geom")?;
-
-        let logical_type = stmt.column_logical_type(0);
-        assert_eq!(logical_type.id(), LogicalTypeId::Geometry);
-        assert_eq!(
-            logical_type.raw_id(),
-            crate::ffi::DUCKDB_TYPE_DUCKDB_TYPE_GEOMETRY as RawLogicalTypeId
-        );
-        assert_eq!(logical_type.geometry_crs(), None);
-        assert_eq!(format!("{logical_type:?}"), "Geometry");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_geometry_column_logical_type_crs_metadata() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let stmt = db.prepare("SELECT ST_SetCRS('POINT EMPTY'::GEOMETRY, 'EPSG:4326') AS geom")?;
-
-        let logical_type = stmt.column_logical_type(0);
-        assert_eq!(logical_type.id(), LogicalTypeId::Geometry);
-        assert_eq!(logical_type.geometry_crs(), Some("EPSG:4326".to_string()));
 
         Ok(())
     }
@@ -2094,49 +1768,6 @@ mod test {
         let stmt = db.prepare("SELECT 1").unwrap();
 
         let _ = stmt.column_logical_type(1);
-    }
-
-    #[test]
-    fn test_column_count_before_execution() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let stmt = db.prepare("SELECT 1 AS a, 'x' AS b, 3.0 AS c")?;
-
-        // The result column count is available from the prepared statement,
-        // without executing the query first.
-        assert_eq!(stmt.column_count(), 3);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_column_count_matches_after_execution() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let mut stmt = db.prepare("SELECT 1 AS a, 'x' AS b")?;
-
-        let before = stmt.column_count();
-        stmt.execute([])?;
-        let after = stmt.column_count();
-
-        // The count read from the prepared statement matches the count read
-        // from the executed result.
-        assert_eq!(before, 2);
-        assert_eq!(before, after);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_column_logical_type_before_execution() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let stmt = db.prepare("SELECT 1::INTEGER AS a, 'x'::VARCHAR AS b")?;
-
-        // Both the count and each column's logical type are readable before
-        // execution, so all result columns can be enumerated up front.
-        assert_eq!(stmt.column_count(), 2);
-        assert_eq!(stmt.column_logical_type(0).id(), LogicalTypeId::Integer);
-        assert_eq!(stmt.column_logical_type(1).id(), LogicalTypeId::Varchar);
-
-        Ok(())
     }
 
     #[test]
@@ -2157,51 +1788,20 @@ mod test {
 
     #[test]
     fn test_variant_streaming_result_decode_unsupported() -> Result<()> {
+        use std::sync::Arc;
+
+        use arrow::datatypes::Schema;
+
         let db = Connection::open_in_memory()?;
         let err = match db
             .prepare("SELECT 1 AS id, {'a': 42}::VARIANT AS variant_col")?
-            .stream_arrow([])
+            .stream_arrow([], Arc::new(Schema::empty()))
         {
             Ok(_) => panic!("expected Variant streaming query to fail"),
             Err(err) => err,
         };
 
         assert_variant_decode_error(err, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn test_variant_returning_execute_rejected_before_mutation() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        db.execute_batch("CREATE TABLE t(id INTEGER, v VARIANT);")?;
-
-        let err = match db.execute("INSERT INTO t VALUES (1, {'a': 42}::VARIANT) RETURNING v", []) {
-            Ok(_) => panic!("expected Variant RETURNING execute to fail"),
-            Err(err) => err,
-        };
-
-        assert_variant_decode_error(err, 0);
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?;
-        assert_eq!(0, count);
-        Ok(())
-    }
-
-    #[test]
-    fn test_variant_returning_streaming_rejected_before_mutation() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        db.execute_batch("CREATE TABLE t(id INTEGER, v VARIANT);")?;
-
-        let err = match db
-            .prepare("INSERT INTO t VALUES (1, {'a': 42}::VARIANT) RETURNING v")?
-            .stream_arrow([])
-        {
-            Ok(_) => panic!("expected Variant RETURNING streaming execute to fail"),
-            Err(err) => err,
-        };
-
-        assert_variant_decode_error(err, 0);
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?;
-        assert_eq!(0, count);
         Ok(())
     }
 
@@ -2240,8 +1840,11 @@ mod test {
         Ok(())
     }
 
+    // Unsupported Value variants must surface an error instead of panicking.
     #[test]
-    fn test_bind_owned_list_inserts_and_borrowed_list_errors() -> Result<()> {
+    fn test_bind_unsupported_container_type_returns_error() -> Result<()> {
+        use crate::types::Value;
+
         struct OwnedList;
         impl ToSql for OwnedList {
             fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
@@ -2252,223 +1855,18 @@ mod test {
         let db = Connection::open_in_memory()?;
         db.execute("CREATE TABLE t (id INTEGER, numbers INTEGER[])", [])?;
 
-        db.execute("INSERT INTO t VALUES (?, ?)", crate::params![1, OwnedList])?;
-        let got: Value = db.query_row("SELECT numbers FROM t", [], |row| row.get(0))?;
-        assert_eq!(got, Value::List(vec![Value::Int(1), Value::Int(2)]));
+        let list = OwnedList;
+        let err = db
+            .execute("INSERT INTO t VALUES (?, ?)", crate::params![1, list])
+            .unwrap_err();
+
+        assert_binding_list_error(err);
 
         let borrowed_list = BorrowedList::new();
         let err = db
             .execute("INSERT INTO t VALUES (?, ?)", crate::params![2, borrowed_list])
             .unwrap_err();
         assert_binding_list_error(err);
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?;
-        assert_eq!(count, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn test_bind_owned_containers() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let quote = "o'reilly";
-        let names = Value::List(vec![Value::Text("alpha".to_string()), Value::Text(quote.to_string())]);
-        let empty = Value::List(vec![]);
-        let empty_struct = Value::Struct(OrderedMap::<String, Value>::from(vec![]));
-        let empty_map = Value::Map(OrderedMap::<Value, Value>::from(vec![]));
-        let with_null = Value::List(vec![Value::Int(1), Value::Null, Value::Int(2)]);
-        let nested = Value::List(vec![
-            Value::List(vec![Value::Int(1)]),
-            Value::List(vec![Value::Int(2), Value::Int(3)]),
-        ]);
-        let array = Value::Array(vec![Value::Int(1), Value::Int(2)]);
-        let structure = Value::Struct(OrderedMap::from(vec![
-            ("k".to_string(), Value::Int(1)),
-            ("name".to_string(), Value::Text("a'b".to_string())),
-        ]));
-        let map = Value::Map(OrderedMap::from(vec![(
-            Value::Text("alpha".to_string()),
-            Value::Int(2),
-        )]));
-
-        fn round_trip(db: &Connection, value: &Value) -> Result<Value> {
-            db.query_row("SELECT ?", [value], |row| row.get(0))
-        }
-
-        let empty_type: String = db.query_row("SELECT typeof(?)", [&empty], |row| row.get(0))?;
-        assert_eq!(empty_type, "VARCHAR[]");
-        let empty_struct_type: String = db.query_row("SELECT typeof(?)", [&empty_struct], |row| row.get(0))?;
-        assert_eq!(empty_struct_type, "STRUCT");
-        let empty_map_type: String = db.query_row("SELECT typeof(?)", [&empty_map], |row| row.get(0))?;
-        assert_eq!(empty_map_type, "MAP(VARCHAR, VARCHAR)");
-        assert_eq!(round_trip(&db, &empty_struct)?, empty_struct);
-        assert_eq!(round_trip(&db, &empty_map)?, empty_map);
-        assert_eq!(round_trip(&db, &names)?, names);
-        assert_eq!(round_trip(&db, &with_null)?, with_null);
-        assert_eq!(round_trip(&db, &nested)?, nested);
-        assert_eq!(round_trip(&db, &array)?, array);
-        assert_eq!(round_trip(&db, &structure)?, structure);
-        assert_eq!(round_trip(&db, &map)?, map);
-
-        db.execute_batch(
-            "CREATE TABLE items(name VARCHAR);
-             INSERT INTO items VALUES ('alpha'), ('other');",
-        )?;
-        // The quote is data. It must not change which rows the predicate matches.
-        db.execute("INSERT INTO items VALUES (?)", [quote])?;
-        let matched = db
-            .prepare("SELECT name FROM items WHERE name IN $names ORDER BY name")?
-            .query_map(crate::named_params! { "names": names }, |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>>>()?;
-        assert_eq!(matched, vec!["alpha".to_string(), quote.to_string()]);
-
-        let err = db
-            .query_row::<i32, _, _>(
-                "SELECT 1 WHERE ? IS NOT NULL",
-                [Value::List(vec![Value::Int(1), Value::Text("a".to_string())])],
-                |row| row.get(0),
-            )
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("cannot bind List with mixed element types"),
-            "unexpected message: {err}"
-        );
-        let err = db
-            .query_row::<i32, _, _>("SELECT ?", [Value::Enum("variant".to_string())], |row| row.get(0))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("binding Enum parameters is not yet supported"),
-            "unexpected message: {err}"
-        );
-        let err = db
-            .query_row::<i32, _, _>("SELECT ?", [Value::Union(Box::new(Value::Int(1)))], |row| row.get(0))
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("binding Union parameters is not yet supported"),
-            "unexpected message: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_bind_rejects_empty_array_and_duplicate_struct_fields() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let struct_of = |names: &[&str]| {
-            Value::Struct(OrderedMap::from(
-                names
-                    .iter()
-                    .map(|name| (name.to_string(), Value::Int(1)))
-                    .collect::<Vec<_>>(),
-            ))
-        };
-        let cases = [
-            (Value::Array(vec![]), "cannot bind an empty Array"),
-            (Value::List(vec![Value::Array(vec![])]), "cannot bind an empty Array"),
-            (struct_of(&["a", "a"]), "cannot bind Struct with duplicate field name"),
-            (struct_of(&["a", "A"]), "cannot bind Struct with duplicate field name"),
-            (
-                Value::List(vec![struct_of(&["k", "K"])]),
-                "cannot bind Struct with duplicate field name",
-            ),
-        ];
-        for (value, expected) in cases {
-            match db.query_row::<Value, _, _>("SELECT ?", [&value], |row| row.get(0)) {
-                Err(Error::ToSqlConversionFailure(e)) => {
-                    assert!(e.to_string().contains(expected), "{value:?}: unexpected message {e}")
-                }
-                other => panic!("{value:?}: expected ToSqlConversionFailure, got {other:?}"),
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_bind_map_rejects_null_and_duplicate_keys() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let null_key = Value::Map(OrderedMap::from(vec![(Value::Null, Value::Int(1))]));
-        let err = db
-            .query_row::<i32, _, _>("SELECT ?", [null_key], |row| row.get(0))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("cannot bind Map with a NULL key"),
-            "unexpected message: {err}"
-        );
-
-        let duplicate = Value::Map(OrderedMap::from(vec![
-            (Value::Int(1), Value::Int(2)),
-            (Value::Int(1), Value::Int(3)),
-        ]));
-        let err = db
-            .query_row::<i32, _, _>("SELECT ?", [duplicate], |row| row.get(0))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("DuckDB rejected the Map value"),
-            "unexpected message: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_bind_container_time_matches_scalar_micros() -> Result<()> {
-        use crate::types::TimeUnit;
-
-        let db = Connection::open_in_memory()?;
-        let second = Value::Timestamp(TimeUnit::Second, 1);
-        let millis = Value::Timestamp(TimeUnit::Millisecond, 1_000);
-        let nanos = Value::Timestamp(TimeUnit::Nanosecond, 1_500_000);
-        let scalar_second: Value = db.query_row("SELECT ?", [&second], |row| row.get(0))?;
-        let scalar_millis: Value = db.query_row("SELECT ?", [&millis], |row| row.get(0))?;
-        let scalar_nanos: Value = db.query_row("SELECT ?", [&nanos], |row| row.get(0))?;
-        let timestamps = Value::List(vec![second, millis, nanos]);
-        let got_timestamps: Value = db.query_row("SELECT ?", [&timestamps], |row| row.get(0))?;
-        assert_eq!(
-            got_timestamps,
-            Value::List(vec![scalar_second, scalar_millis, scalar_nanos])
-        );
-
-        let time_nanos = Value::Time64(TimeUnit::Nanosecond, 2_500_000);
-        let scalar_time: Value = db.query_row("SELECT ?", [&time_nanos], |row| row.get(0))?;
-        let times = Value::List(vec![time_nanos]);
-        let got_times: Value = db.query_row("SELECT ?", [&times], |row| row.get(0))?;
-        assert_eq!(got_times, Value::List(vec![scalar_time]));
-        Ok(())
-    }
-
-    #[test]
-    fn test_bind_container_children_with_compatible_types() -> Result<()> {
-        let db = Connection::open_in_memory()?;
-        let struct_gen = |a: Value| Value::Struct(OrderedMap::from(vec![("a".to_string(), a)]));
-        let cases = [
-            Value::List(vec![Value::List(vec![]), Value::List(vec![Value::Int(1)])]),
-            Value::List(vec![struct_gen(Value::Int(1)), struct_gen(Value::Null)]),
-            Value::List(vec![
-                Value::Map(OrderedMap::from(vec![(Value::Int(1), Value::Int(2))])),
-                Value::Map(OrderedMap::from(vec![(Value::Int(1), Value::Null)])),
-            ]),
-        ];
-        for value in cases {
-            let got: Value = db.query_row("SELECT ?", [&value], |row| row.get(0))?;
-            assert_eq!(got, value);
-        }
-
-        let narrow = Decimal::new(2, 1, 15)?;
-        let wide = Decimal::new(3, 1, 125)?;
-        let decimals = Value::List(vec![Value::Decimal(narrow), Value::Decimal(wide)]);
-        let decimal_type: String = db.query_row("SELECT typeof(?)", [&decimals], |row| row.get(0))?;
-        assert_eq!(decimal_type, "DECIMAL(3,1)[]");
-        let got: Value = db.query_row("SELECT ?", [&decimals], |row| row.get(0))?;
-        let Value::List(items) = got else {
-            panic!("expected a list, got {got:?}");
-        };
-        let mut payloads = Vec::new();
-        for item in items {
-            let Value::Decimal(decimal) = item else {
-                panic!("expected a decimal, got {item:?}");
-            };
-            assert_eq!(decimal.width(), 3);
-            assert_eq!(decimal.scale(), 1);
-            payloads.push(decimal.value());
-        }
-        assert_eq!(payloads, vec![15, 125]);
         Ok(())
     }
 

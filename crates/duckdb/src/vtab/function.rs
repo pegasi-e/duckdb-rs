@@ -1,21 +1,18 @@
 use super::{
-    LogicalTypeHandle, VTab, Value,
+    LogicalTypeHandle, VTab, Value, drop_boxed,
     ffi::{
         duckdb_bind_add_result_column, duckdb_bind_get_extra_info, duckdb_bind_get_named_parameter,
         duckdb_bind_get_parameter, duckdb_bind_get_parameter_count, duckdb_bind_info, duckdb_bind_set_bind_data,
-        duckdb_bind_set_cardinality, duckdb_bind_set_error, duckdb_client_context,
-        duckdb_client_context_get_config_option, duckdb_create_table_function, duckdb_data_chunk,
-        duckdb_delete_callback_t, duckdb_destroy_client_context, duckdb_destroy_table_function, duckdb_table_function,
-        duckdb_table_function_add_named_parameter, duckdb_table_function_add_parameter,
-        duckdb_table_function_get_client_context, duckdb_table_function_init_t, duckdb_table_function_set_bind,
-        duckdb_table_function_set_extra_info, duckdb_table_function_set_function, duckdb_table_function_set_init,
-        duckdb_table_function_set_local_init, duckdb_table_function_set_name,
+        duckdb_bind_set_cardinality, duckdb_bind_set_error, duckdb_create_table_function, duckdb_data_chunk,
+        duckdb_delete_callback_t, duckdb_destroy_table_function, duckdb_table_function,
+        duckdb_table_function_add_named_parameter, duckdb_table_function_add_parameter, duckdb_table_function_init_t,
+        duckdb_table_function_set_bind, duckdb_table_function_set_extra_info, duckdb_table_function_set_function,
+        duckdb_table_function_set_init, duckdb_table_function_set_local_init, duckdb_table_function_set_name,
         duckdb_table_function_supports_projection_pushdown, idx_t,
     },
 };
-use crate::callback::{CallbackErrorSink, drop_boxed};
 use std::{
-    ffi::{CStr, CString, c_void},
+    ffi::{CString, c_void},
     fmt::Debug,
     marker::PhantomData,
     os::raw::c_char,
@@ -34,19 +31,21 @@ impl BindInfo {
     ///  * `name`: The name of the column
     ///  * `type`: The logical type of the column
     pub fn add_result_column(&self, column_name: &str, column_type: LogicalTypeHandle) {
-        let c_str = CString::new(column_name).expect("result column name must not contain NUL bytes");
+        let c_str = CString::new(column_name).unwrap();
         unsafe {
             duckdb_bind_add_result_column(self.ptr, c_str.as_ptr() as *const c_char, column_type.ptr);
         }
     }
 
     /// Report that an error has occurred while calling bind.
-    /// Interior NUL bytes are reported as the two-character sequence `\0`.
     ///
     /// # Arguments
     ///  * `error`: The error message
     pub fn set_error(&self, error: &str) {
-        self.report_error(error);
+        let c_str = CString::new(error).unwrap();
+        unsafe {
+            duckdb_bind_set_error(self.ptr, c_str.as_ptr() as *const c_char);
+        }
     }
     /// Sets the user-provided bind data in the bind object. This object can be retrieved again during execution.
     ///
@@ -93,49 +92,9 @@ impl BindInfo {
     /// returns: The value of the parameter
     pub fn get_named_parameter(&self, name: &str) -> Option<Value> {
         unsafe {
-            let name = &CString::new(name).expect("named parameter must not contain NUL bytes");
+            let name = &CString::new(name).unwrap();
             let ptr = duckdb_bind_get_named_parameter(self.ptr, name.as_ptr());
             if ptr.is_null() { None } else { Some(Value::from(ptr)) }
-        }
-    }
-
-    /// Retrieves the value of a session/config option available during the bind stage.
-    ///
-    /// This looks up a DuckDB configuration option (such as a session setting) by name
-    /// using the client context of the current table function bind. It returns `None`
-    /// if the option is unset or unknown.
-    ///
-    /// This is primarily useful for loadable extensions that need to read configuration
-    /// state while binding a table function.
-    ///
-    /// # Arguments
-    /// * `name`: The name of the configuration option to look up
-    ///
-    /// returns: The value of the option, or `None` if it is not set
-    ///
-    /// # Note
-    /// Only query option names you know to be registered. On an unregistered option
-    /// name, DuckDB's C API (`duckdb_client_context_get_config_option`) returns a null
-    /// value in release builds, but in debug/assertion builds it raises an internal
-    /// error. That error is a C++ exception thrown across the FFI boundary, which
-    /// cannot be caught from Rust and aborts the process, so the caller must
-    /// pre-validate the name. Passing a known option name avoids this.
-    pub fn get_config_option(&self, name: &str) -> Option<Value> {
-        let cname = CString::new(name).expect("config option name must not contain NUL bytes");
-        unsafe {
-            let mut ctx: duckdb_client_context = std::ptr::null_mut();
-            duckdb_table_function_get_client_context(self.ptr, &mut ctx);
-            // `get_client_context` is not documented to write `ctx` on every path;
-            // guard against passing a null context to the lookup, which would
-            // dereference it C++-side. Destroying a null context is a safe no-op.
-            let value = if ctx.is_null() {
-                None
-            } else {
-                let ptr = duckdb_client_context_get_config_option(ctx, cname.as_ptr(), std::ptr::null_mut());
-                if ptr.is_null() { None } else { Some(Value::from(ptr)) }
-            };
-            duckdb_destroy_client_context(&mut ctx);
-            value
         }
     }
 
@@ -156,14 +115,6 @@ impl BindInfo {
 impl From<duckdb_bind_info> for BindInfo {
     fn from(ptr: duckdb_bind_info) -> Self {
         Self { ptr }
-    }
-}
-
-impl CallbackErrorSink for BindInfo {
-    fn set_c_error(&self, error: &CStr) {
-        unsafe {
-            duckdb_bind_set_error(self.ptr, error.as_ptr());
-        }
     }
 }
 
@@ -232,18 +183,12 @@ impl InitInfo {
     }
 
     /// Report that an error has occurred while calling init.
-    /// Interior NUL bytes are reported as the two-character sequence `\0`.
     ///
     /// # Arguments
     /// * `error`: The error message
     pub fn set_error(&self, error: &str) {
-        self.report_error(error);
-    }
-}
-
-impl CallbackErrorSink for InitInfo {
-    fn set_c_error(&self, error: &CStr) {
-        unsafe { duckdb_init_set_error(self.0, error.as_ptr()) }
+        let c_str = CString::new(error).unwrap();
+        unsafe { duckdb_init_set_error(self.0, c_str.as_ptr()) }
     }
 }
 
@@ -419,12 +364,14 @@ pub struct TableFunctionInfo<V: VTab> {
 
 impl<V: VTab> TableFunctionInfo<V> {
     /// Report that an error has occurred while executing the function.
-    /// Interior NUL bytes are reported as the two-character sequence `\0`.
     ///
     /// # Arguments
     ///  * `error`: The error message
     pub fn set_error(&self, error: &str) {
-        self.report_error(error);
+        let c_str = CString::new(error).unwrap();
+        unsafe {
+            duckdb_function_set_error(self.ptr, c_str.as_ptr());
+        }
     }
 
     /// Gets the bind data set by [`BindInfo::set_bind_data`] during the bind.
@@ -464,14 +411,6 @@ impl<V: VTab> TableFunctionInfo<V> {
     /// * `returns`: The init data object
     pub fn get_local_init_data<T>(&self) -> *mut T {
         unsafe { duckdb_function_get_local_init_data(self.ptr).cast() }
-    }
-}
-
-impl<V: VTab> CallbackErrorSink for TableFunctionInfo<V> {
-    fn set_c_error(&self, error: &CStr) {
-        unsafe {
-            duckdb_function_set_error(self.ptr, error.as_ptr());
-        }
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{is_compiler, link_windows_system_libs, win_target, write_bindings};
+use crate::{is_compiler, win_target, write_bindings};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -42,30 +42,24 @@ fn extension_enabled(extension: &str) -> bool {
         || (extension == "json" && cfg!(feature = "json"))
 }
 
-const STATIC_EXTENSION_AUTOREGISTER: &str = "duckdb/extension/loader/static_extension_autoregister.cpp";
+fn untar_archive(out_dir: &str) {
+    let path = "duckdb.tar.gz";
 
-fn build_static_extension_autoregister(source_root: &Path, out_dir: &str) {
-    let lib_name = "duckdb_static_extension_autoregister";
-    // The upstream file has no global symbols, which makes ranlib warn about an empty table of contents.
-    let wrapper = source_root.join(crate::bundled_sources::AUTOREGISTER_WRAPPER);
-    let source_dir = source_root.join(STATIC_EXTENSION_AUTOREGISTER);
-    cc::Build::new()
-        .cpp(true)
-        .file(&wrapper)
-        .include(source_dir.parent().expect("autoregister source directory"))
-        .warnings(false)
-        .cargo_metadata(false)
-        .compile(lib_name);
-    println!("cargo:rustc-link-search=native={out_dir}");
-    println!("cargo:rustc-link-lib=static:+whole-archive={lib_name}");
+    let tar_gz = std::fs::File::open(path).expect("archive file");
+    let tar = flate2::read::GzDecoder::new(tar_gz);
+    let mut archive = tar::Archive::new(tar);
+    // These archives are generated for reproducibility, not source mtimes.
+    // Skipping mtime restoration also avoids Windows SetFileTime failures on
+    // filesystems such as FAT32, which cannot represent Unix epoch mtimes.
+    archive.set_preserve_mtime(false);
+    archive.unpack(out_dir).expect("archive");
 }
 
-pub fn main(out_dir: &str) {
-    let source_root = crate::bundled_sources::unpack(Path::new("duckdb.tar.gz"), Path::new(out_dir))
-        .expect("unpacking bundled DuckDB sources");
+pub fn main(out_dir: &str, out_path: &Path) {
+    untar_archive(out_dir);
 
-    let include_path = source_root.join("duckdb/src/include");
-    write_bindings(&include_path, out_dir);
+    let include_path = Path::new(out_dir).join("duckdb/src/include");
+    write_bindings(&include_path, out_path);
 
     // Publish the include directory so downstream crates that compile
     // their own C/C++ code (e.g. extension shims that #include
@@ -74,7 +68,7 @@ pub fn main(out_dir: &str) {
     // the package manifest.
     println!("cargo:include={}", include_path.display());
 
-    let manifest_file = std::fs::File::open(source_root.join("duckdb/manifest.json")).expect("manifest file");
+    let manifest_file = std::fs::File::open(format!("{out_dir}/duckdb/manifest.json")).expect("manifest file");
     let manifest: Manifest = serde_json::from_reader(manifest_file).expect("reading manifest file");
 
     let mut cpp_files = HashSet::new();
@@ -104,37 +98,25 @@ pub fn main(out_dir: &str) {
 
     println!("cargo:rerun-if-changed=duckdb.tar.gz");
 
-    // Keep the constructor even though Rust code does not reference it directly.
-    if cpp_files.remove(STATIC_EXTENSION_AUTOREGISTER) {
-        build_static_extension_autoregister(&source_root, out_dir);
-    }
-
-    let mut include_dirs: Vec<_> = include_dirs.into_iter().collect();
-    include_dirs.sort();
-    cfg.include(source_root.join("duckdb"));
-    cfg.includes(include_dirs.iter().map(|dir| source_root.join("duckdb").join(dir)));
+    cfg.include("duckdb");
+    cfg.includes(include_dirs.iter().map(|dir| format!("{out_dir}/duckdb/{dir}")));
 
     let mut cpp_files_vec: Vec<String> = cpp_files.into_iter().collect();
     cpp_files_vec.sort();
-    for f in cpp_files_vec.into_iter().map(|file| source_root.join(file)) {
+    for f in cpp_files_vec.into_iter().map(|file| format!("{out_dir}/{file}")) {
         cfg.file(f);
     }
 
-    // DuckDB 2.0 requires C++17 (mirrors CMAKE_CXX_STANDARD in duckdb-sources/CMakeLists.txt).
     cfg.cpp(true)
-        .flag_if_supported("-std=c++17")
-        .flag_if_supported("/std:c++17")
+        .flag_if_supported("-std=c++11")
         .flag_if_supported("/utf-8")
         .flag_if_supported("/bigobj")
         .warnings(false)
         .flag_if_supported("-w");
 
-    // Enable C++ exceptions on MSVC: without /EHsc, exception handling is off, the
-    // C API's try/catch blocks are inert, and a thrown exception (e.g. invalid-UTF-8
-    // CSV read) aborts with STATUS_STACK_BUFFER_OVERRUN (#774). Hard flag, not
-    // flag_if_supported, so a spurious probe miss can't silently drop it. gcc/clang
-    // enable exceptions by default and reject /EHsc, so gate on MSVC. Mirrors
-    // build_bundled_cmake.rs.
+    // MSVC requires explicit exception handling so DuckDB catches native
+    // errors at its C API boundary instead of unwinding into Rust (#774).
+    // Use a hard flag: a failed capability probe must not silently omit it.
     if win_target() && is_compiler("msvc") {
         cfg.flag("/EHsc");
     }
@@ -143,12 +125,7 @@ pub fn main(out_dir: &str) {
         Ok(v) => v != "false" && v != "0",
         Err(_) => false,
     };
-    // Mirror DuckDB's CMake build types: Debug defines DEBUG (enables D_ASSERT
-    // and the debug-only verification paths), Release defines NDEBUG. DuckDB's
-    // sources assume exactly one of the two is set.
-    if is_debug {
-        cfg.define("DEBUG", None);
-    } else {
+    if !is_debug {
         cfg.define("NDEBUG", None);
     }
 
@@ -157,10 +134,15 @@ pub fn main(out_dir: &str) {
     }
     cfg.compile("duckdb");
 
-    // `cc` does not link DuckDB's Windows system libs automatically (e.g. unresolved
-    // `RmStartSession` from the Restart Manager). See link_windows_system_libs.
+    // Static archives do not propagate DuckDB's Windows system dependencies.
+    // Match duckdb-sources/src/CMakeLists.txt, including Restart Manager for
+    // AdditionalLockInfo's RmStartSession/RmGetList calls.
     if win_target() {
-        link_windows_system_libs();
+        println!("cargo:rustc-link-lib=dylib=ws2_32");
+        println!("cargo:rustc-link-lib=dylib=rstrtmgr");
+        if is_compiler("msvc") {
+            println!("cargo:rustc-link-lib=dylib=bcrypt");
+        }
     }
 
     println!("cargo:lib_dir={out_dir}");

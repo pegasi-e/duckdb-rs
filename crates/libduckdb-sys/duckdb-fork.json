@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/jeremyosterhoudt/duckdb.git",
+  "commit": "d5adf13edc1d1964573f2e80bb44ccd85f1bb524",
+  "version": "1.5.6",
+  "rust_bindings_base": "pegasi-e/duckdb-rs 1.10503.1 (75946816cddcc03f47f5f774c943c729f36e214e)"
+}

@@ -1,28 +1,40 @@
-name: Release
-
+name: Prepare manual upload
 on:
-  push:
-    tags: ["*"]
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: full
+  workflow_run:
+    workflows: [Bundled fork]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Bundled fork run to package for manual upload
+        required: true
+        type: string
+        default: "40962050450"
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: manual-upload-${{ github.event.workflow_run.id || inputs.source_run_id }}
+  cancel-in-progress: false
 jobs:
-  release:
-    name: Cargo Publish
+  package:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    env:
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Check packaging behavior
+        run: python3 -m unittest discover -s scripts -p test_prepare_upload_artifact.py
+      - name: Collect and verify native build ZIPs
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/prepare_upload_artifact.py --run-id "$SOURCE_RUN_ID"
+      - uses: actions/upload-artifact@v4
         with:
-          cache: false
-
-      - name: publish crates
-        uses: katyo/publish-crates@v2
-        with:
-          path: "./"
-          args: --no-verify --allow-dirty
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          ignore-unpublished-changes: true
-
-# NOTE: After running this action, manually create a new release via https://github.com/duckdb/duckdb-rs/releases/new
-# TODO: Automate the entire release process
+          name: ${{ steps.prepare.outputs.artifact_name }}
+          path: ${{ steps.prepare.outputs.directory }}/
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true

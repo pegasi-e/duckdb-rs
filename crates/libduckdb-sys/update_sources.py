@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import gzip
+import hashlib
+import subprocess
 import json
 import os
 import shutil
@@ -11,6 +13,19 @@ import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+with (SCRIPT_DIR / "duckdb-fork.json").open() as f:
+    fork = json.load(f)
+source_dir = SCRIPT_DIR / "duckdb-sources"
+actual_commit = subprocess.check_output(
+    ["git", "-C", str(source_dir), "rev-parse", "HEAD"], text=True
+).strip()
+if actual_commit != fork["commit"]:
+    raise SystemExit(f"Expected DuckDB {fork['commit']}, found {actual_commit}")
+subprocess.check_call(["git", "-C", str(source_dir), "diff", "--exit-code", "HEAD", "--"])
+# The inherited tags in this fork do not describe its upstream API version.
+os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = fork["version"]
+os.environ["SETUPTOOLS_SCM_PRETEND_HASH"] = fork["commit"][:11]
 
 DUCKDB_SCRIPTS_DIR = SCRIPT_DIR / "duckdb-sources" / "scripts"
 TARGET_DIR = SCRIPT_DIR / "duckdb"
@@ -31,18 +46,6 @@ ARCHIVE_MTIME = 946684800  # 2000-01-01T00:00:00Z
 # but not included in the final build unless they're explicitly enabled.
 EXTENSIONS = ["core_functions", "parquet", "json"]
 
-# DuckDB 2.0 lists third_party/jemalloc as a core third-party source, but its
-# CMake build only enables it on 64-bit Linux, and the `cc` backend compiles
-# every listed file as C++, which jemalloc's C sources do not survive. Drop it
-# from the bundled tree; the `bundled-cmake` backend still gets jemalloc
-# through ENABLE_JEMALLOC.
-EXCLUDED_THIRD_PARTY = ["third_party/jemalloc"]
-
-
-def is_excluded(path):
-    normalized = Path(path).as_posix()
-    return any(f"/{excluded}" in f"/{normalized}" for excluded in EXCLUDED_THIRD_PARTY)
-
 # Clear the duckdb directory
 try:
     shutil.rmtree(TARGET_DIR)
@@ -53,16 +56,6 @@ TARGET_DIR.mkdir()
 
 sys.path.append(str(DUCKDB_SCRIPTS_DIR))
 import package_build
-
-# DuckDB has a forward-slashed `extension/loader` compile directory. Its
-# recursive walk appends native separators, producing mixed paths on Windows
-# that package_build.py cannot split into individual parent directories.
-# Every entry is separator-simple, so this is a no-op off Windows.
-import amalgamation
-
-amalgamation.compile_directories = [
-    os.path.normpath(path) for path in amalgamation.compile_directories
-]
 
 
 def get_sources(extensions, default_linked_extensions=None):
@@ -75,17 +68,12 @@ def get_sources(extensions, default_linked_extensions=None):
     )
     PACKAGE_BUILD_LOADER_PATH.unlink(missing_ok=True)
 
-    # Remove the absolute prefix on the files (some get generated with it).
-    # DuckDB returns forward-slash paths even on Windows, so compare against
-    # the package root's forward-slash representation.
-    script_dir_prefix = f"{SCRIPT_DIR.as_posix()}/"
+    # Remove the absolute prefix on the files (some get generated with it)
+    script_dir_prefix = f"{SCRIPT_DIR}{os.path.sep}"
     source_list = [
         x[len(script_dir_prefix) :] if x.startswith(script_dir_prefix) else x
         for x in source_list
     ]
-
-    source_list = [x for x in source_list if not is_excluded(x)]
-    include_list = [x for x in include_list if not is_excluded(x)]
 
     return set(source_list), set(include_list)
 
@@ -115,9 +103,6 @@ manifest = {
     },
     "extensions": extension_sources,
 }
-
-for excluded in EXCLUDED_THIRD_PARTY:
-    shutil.rmtree(TARGET_DIR / excluded, ignore_errors=True)
 
 with (TARGET_DIR / "manifest.json").open("w") as f:
     json.dump(manifest, f, indent=2, sort_keys=True)
@@ -210,3 +195,8 @@ def replace_archive_if_changed():
 
 
 replace_archive_if_changed()
+
+with ARCHIVE_PATH.open("rb") as f:
+    digest = hashlib.sha256(f.read()).hexdigest()
+with Path(str(ARCHIVE_PATH) + ".sha256").open("w") as f:
+    f.write(f"{digest}  duckdb.tar.gz\n")

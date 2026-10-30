@@ -1,4 +1,4 @@
-use crate::{is_compiler, link_windows_system_libs, win_target, write_bindings};
+use crate::{is_compiler, win_target, write_bindings};
 use std::{
     collections::BTreeSet,
     env::{self, VarError},
@@ -12,7 +12,7 @@ struct Generator {
     make_program: Option<String>,
 }
 
-pub fn main(out_dir: &str) {
+pub fn main(out_dir: &str, out_path: &Path) {
     let source_dir = Path::new("duckdb-sources");
     let cmake_lists = source_dir.join("CMakeLists.txt");
     if !cmake_lists.exists() {
@@ -23,7 +23,6 @@ pub fn main(out_dir: &str) {
     }
 
     println!("cargo:rerun-if-changed={}", source_dir.display());
-    println!("cargo:rerun-if-env-changed=DUCKDB_VERSION");
     println!("cargo:rerun-if-env-changed=DUCKDB_EXTENSION_CONFIGS");
     println!("cargo:rerun-if-env-changed=DUCKDB_CMAKE_BUILD_TYPE");
     println!("cargo:rerun-if-env-changed=DUCKDB_DISABLE_UNITY");
@@ -37,7 +36,7 @@ pub fn main(out_dir: &str) {
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
 
     let include_path = source_dir.join("src/include").canonicalize().unwrap();
-    write_bindings(&include_path, out_dir);
+    write_bindings(&include_path, out_path);
 
     // Publish the include directory so downstream crates that compile
     // their own C/C++ code can read it from `DEP_DUCKDB_INCLUDE`.
@@ -52,8 +51,6 @@ pub fn main(out_dir: &str) {
         }
     }
 
-    let version = crate::build_version::cmake_version(env!("CARGO_PKG_VERSION"), env_var("DUCKDB_VERSION").as_deref());
-    cargo_warning(&format!("bundled-cmake DuckDB version: {version}"));
     let cmake_build_type = cmake_build_type();
     let generator = select_generator(out_dir);
     let mut config = cmake::Config::new(source_dir);
@@ -65,31 +62,19 @@ pub fn main(out_dir: &str) {
         config.define("CMAKE_MAKE_PROGRAM", make_program);
     }
     configure_macos_deployment_target(&mut config);
-    // Always overwrite the cached version, including when an override is removed.
     config
         .profile(&cmake_build_type)
-        .define("DUCKDB_EXPLICIT_VERSION", &version)
         .define("BUILD_UNITTESTS", "0")
         .define("BUILD_SHELL", "0")
         .define("CMAKE_INSTALL_LIBDIR", "lib")
-        .define("CMAKE_C_FLAGS_INIT", init_flags())
-        .define("CMAKE_CXX_FLAGS_INIT", init_flags());
+        .define("CMAKE_C_FLAGS_INIT", warning_suppression_flag())
+        .define("CMAKE_CXX_FLAGS_INIT", warning_suppression_flag());
 
-    // Re-enable C++ exceptions on MSVC. The cmake crate makes its `cxxflag`s the
-    // source of -DCMAKE_CXX_FLAGS, replacing CMake's default (which includes /EHsc),
-    // so exception handling ends up effectively off: a thrown exception (e.g.
-    // invalid-UTF-8 CSV read) then aborts with STATUS_STACK_BUFFER_OVERRUN (#774).
-    //
-    // Don't `config.define("CMAKE_CXX_FLAGS", ..)` here: it overrides the cxxflag
-    // above and silently drops /EHsc, reintroducing #774.
-    // Mirrors build_bundled_cc.rs; gcc/clang enable exceptions by default.
+    // The cmake crate replaces CMAKE_CXX_FLAGS, dropping CMake's default
+    // /EHsc. Keep native errors inside DuckDB's C API on MSVC (#774).
+    // Do not define CMAKE_CXX_FLAGS explicitly: that would discard cxxflag.
     if win_target() && is_compiler("msvc") {
         config.cxxflag("/EHsc");
-        // CMake's default `/DWIN32 /D_WINDOWS` is dropped the same way; the TPC-H dbgen
-        // sources need `WIN32` to include <process.h> before their own macros.
-        for flag in ["/DWIN32", "/D_WINDOWS"] {
-            config.cflag(flag).cxxflag(flag);
-        }
     }
 
     // Unity builds (DuckDB's default) combine .cpp files into fewer translation
@@ -101,16 +86,7 @@ pub fn main(out_dir: &str) {
     // Always set explicitly so the CMake cache does not keep a stale value when
     // the environment variable changes between builds.
     let disable_extension_load = env_flag_aliases(&["DUCKDB_DISABLE_EXTENSION_LOAD", "DISABLE_EXTENSION_LOAD"]);
-    config
-        .define("DISABLE_EXTENSION_LOAD", "0")
-        .define(
-            "ENABLE_EXTENSION_LOAD",
-            if disable_extension_load { "OFF" } else { "ON" },
-        )
-        .define(
-            "ENABLE_BUILTIN_HTTPLIB",
-            if disable_extension_load { "OFF" } else { "ON" },
-        );
+    config.define("DISABLE_EXTENSION_LOAD", if disable_extension_load { "1" } else { "0" });
 
     // Forward compiler launcher for sccache/ccache integration.
     for var in ["CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER"] {
@@ -119,91 +95,46 @@ pub fn main(out_dir: &str) {
         }
     }
 
-    #[cfg(feature = "httpfs")]
-    configure_httpfs_dependencies(&mut config);
-
     let enabled_extensions = enabled_extensions();
     if !enabled_extensions.is_empty() {
         config.define("BUILD_EXTENSIONS", enabled_extensions.join(";"));
     }
-    // DuckDB's base extension config always builds json and icu; skip them unless requested.
-    let skipped_extensions: Vec<&str> = ["json", "icu"]
-        .into_iter()
-        .filter(|ext| !enabled_extensions.contains(ext))
-        .collect();
-    config.define("SKIP_EXTENSIONS", skipped_extensions.join(";"));
 
     // Always set explicitly so old CMake caches do not keep stale allocator
     // state. By default this enables jemalloc on DuckDB's supported 64-bit,
     // non-musl Linux targets and remains a no-op elsewhere. The env var is an
     // escape hatch back to DuckDB's standard allocator.
     let disable_jemalloc = env_flag("DUCKDB_DISABLE_JEMALLOC");
+    config.define("SKIP_EXTENSIONS", "");
     config.define("ENABLE_JEMALLOC", if disable_jemalloc { "OFF" } else { "ON" });
 
-    // Windows MAX_PATH caveat: this build emits very deep object paths (Ninja ignores
-    // CMAKE_OBJECT_PATH_MAX), and since DuckDB 2.0 the unity build includes each
-    // source by a path relative to the build directory (`#include "../../.../src/x.cpp"`),
-    // which MSVC measures unnormalized. A deep OUT_DIR therefore fails with
-    // `C1083: Cannot open compiler generated file: ''` or `C1083: Cannot open include
-    // file: '../../..'`. The build script can't move OUT_DIR — shorten the path (short
-    // CARGO_TARGET_DIR such as `D:/t`, drop `--target`, or check out nearer the drive
-    // root), or set DUCKDB_DISABLE_UNITY=1 to compile each file individually.
+    // Upstream CMake defaults these to OFF, but duckdb-rs `bundled` has historically
+    // shipped with both enabled. Keep `bundled-cmake` aligned with `bundled` unless
+    // extension loading is compiled out entirely.
+    config
+        .define(
+            "ENABLE_EXTENSION_AUTOLOADING",
+            if disable_extension_load { "0" } else { "1" },
+        )
+        .define(
+            "ENABLE_EXTENSION_AUTOINSTALL",
+            if disable_extension_load { "0" } else { "1" },
+        );
+
     let dst = config.build();
     let lib_dir = dst.join("lib");
     validate_extension_libraries(&lib_dir, &cmake_build_type, &enabled_extensions);
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     // Emit in dependents-before-dependencies order for single-pass linkers:
-    // loader → capabilities/extensions → duckdb_static (which satisfies all core symbols).
-    let capabilities: &[&str] = if disable_extension_load {
-        &[]
-    } else {
-        &["httplib", "loadable_extensions"]
-    };
-    let mut linked_extensions = capabilities.to_vec();
-    linked_extensions.push("core_functions");
-    linked_extensions.extend(enabled_extensions.iter().copied());
-    build_static_extension_loader(source_dir, out_dir, &linked_extensions);
-    for capability in capabilities {
-        link_static_library(&lib_dir, &cmake_build_type, &format!("duckdb_{capability}"));
-    }
+    // loader → extensions → duckdb_static (which satisfies all core symbols).
+    link_static_library(&lib_dir, &cmake_build_type, "duckdb_generated_extension_loader");
     link_static_library(&lib_dir, &cmake_build_type, "core_functions_extension");
     for extension in enabled_extensions {
         link_static_library(&lib_dir, &cmake_build_type, &format!("{extension}_extension"));
     }
     link_static_library(&lib_dir, &cmake_build_type, "duckdb_static");
     link_system_libs();
-    #[cfg(feature = "httpfs")]
-    emit_httpfs_link_metadata();
     println!("cargo:lib_dir={}", lib_dir.display());
-}
-
-#[cfg(feature = "httpfs")]
-fn configure_httpfs_dependencies(config: &mut cmake::Config) {
-    if win_target() {
-        panic!("bundled-cmake httpfs is currently supported only on Linux and macOS");
-    }
-
-    // Only OpenSSL needs a hint (Homebrew keeps it keg-only). Do not hint curl:
-    // FindCURL locates the sysroot curl itself, and a pkg-config prefix may point
-    // at a different SDK than the compiler, breaking libc++ header ordering.
-    let openssl_prefix = pkg_config::get_variable("openssl", "prefix")
-        .unwrap_or_else(|err| panic!("bundled-cmake httpfs requires openssl through pkg-config: {err}"));
-    config.define("OPENSSL_ROOT_DIR", openssl_prefix);
-}
-
-#[cfg(feature = "httpfs")]
-fn emit_httpfs_link_metadata() {
-    for name in ["libcurl", "openssl"] {
-        pkg_config::Config::new()
-            .probe(name)
-            .unwrap_or_else(|err| panic!("bundled-cmake httpfs requires {name} through pkg-config: {err}"));
-    }
-    // HTTPFS's OpenSSL client reads the macOS certificate store. Mirror its
-    // CMake framework dependencies, which static archives do not carry over.
-    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos") {
-        println!("cargo:rustc-link-lib=framework=CoreFoundation");
-        println!("cargo:rustc-link-lib=framework=Security");
-    }
 }
 
 fn cmake_build_type() -> String {
@@ -275,7 +206,7 @@ fn select_generator(out_dir: &str) -> Generator {
     }
 }
 
-fn init_flags() -> &'static str {
+fn warning_suppression_flag() -> &'static str {
     if win_target() && is_compiler("msvc") {
         "/w"
     } else {
@@ -290,9 +221,9 @@ fn configure_macos_deployment_target(config: &mut cmake::Config) {
 
     let target_arch_env =
         env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo should set CARGO_CFG_TARGET_ARCH for macOS builds");
-    let target_arch = match target_arch_env.as_str() {
-        "aarch64" => "arm64",
-        "x86_64" => "x86_64",
+    let (target_arch, default_deployment_target) = match target_arch_env.as_str() {
+        "aarch64" => ("arm64", "11.0"),
+        "x86_64" => ("x86_64", "10.15"),
         other => {
             panic!("bundled-cmake: unsupported macOS CARGO_CFG_TARGET_ARCH `{other}`; expected `aarch64` or `x86_64`")
         }
@@ -300,7 +231,7 @@ fn configure_macos_deployment_target(config: &mut cmake::Config) {
 
     let deployment_target = env_var("MACOSX_DEPLOYMENT_TARGET")
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "11.0".to_string());
+        .unwrap_or_else(|| default_deployment_target.to_string());
     cargo_warning(&format!(
         "bundled-cmake macOS deployment target: {deployment_target} ({target_arch})"
     ));
@@ -412,55 +343,6 @@ fn validate_extension_libraries(lib_dir: &Path, cmake_build_type: &str, enabled_
     }
 }
 
-/// Renders `extension/loader/static_extension_loader.c.in` for `extensions`, mirroring
-/// `duckdb_write_static_extension_loader` in `extension/extension_build_tools.cmake`.
-fn render_static_extension_loader(template: &str, extensions: &[&str]) -> String {
-    let declarations = extensions
-        .iter()
-        .map(|ext| format!("int32_t duckdb_extension_{ext}_describe(duckdb_extension_descriptor *descriptor);"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let registrations = extensions
-        .iter()
-        .map(|ext| {
-            format!("\tif (duckdb_register_static_extension(duckdb_extension_{ext}_describe) != 0) {{\n\t\tresult = 1;\n\t}}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    template
-        .replace("@LINK_EXTENSION_LIST@", &extensions.join(" "))
-        .replace("@DESCRIBE_DECLARATIONS@", &declarations)
-        .replace("@DESCRIBE_REGISTRATIONS@", &registrations)
-}
-
-/// Builds the loader that registers `extensions` before `main`. CMake only generates it for executables
-/// and the shared library, not for `duckdb_static`.
-fn build_static_extension_loader(source_dir: &Path, out_dir: &str, extensions: &[&str]) {
-    let loader_dir = source_dir.join("extension/loader");
-    let template_path = loader_dir.join("static_extension_loader.c.in");
-    let autoregister_path = loader_dir.join("static_extension_autoregister.cpp");
-    let template = fs::read_to_string(&template_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", template_path.display()));
-
-    // Compiled as C++ so it shares a compiler with the autoregister file; the template is extern "C".
-    let loader_path = Path::new(out_dir).join("static_extension_loader.cpp");
-    fs::write(&loader_path, render_static_extension_loader(&template, extensions))
-        .unwrap_or_else(|err| panic!("failed to write {}: {err}", loader_path.display()));
-
-    let lib_name = "duckdb_static_extension_loader";
-    cc::Build::new()
-        .cpp(true)
-        .file(&loader_path)
-        .file(&autoregister_path)
-        .include(source_dir.join("src/include"))
-        .define("DUCKDB_STATIC_BUILD", None)
-        .cargo_metadata(false)
-        .compile(lib_name);
-    println!("cargo:rustc-link-search=native={out_dir}");
-    // Nothing references the autoregister object, so keep the linker from dropping its static initializer.
-    println!("cargo:rustc-link-lib=static:+whole-archive={lib_name}");
-}
-
 fn link_static_library(lib_dir: &Path, cmake_build_type: &str, name: &str) {
     let Some(library_path) = resolve_static_library(lib_dir, cmake_build_type, name) else {
         let filename = static_library_filename(name);
@@ -561,9 +443,6 @@ fn enabled_extensions() -> Vec<&'static str> {
     if cfg!(feature = "autocomplete") {
         extensions.push("autocomplete");
     }
-    if cfg!(feature = "httpfs") {
-        extensions.push("httpfs");
-    }
     if cfg!(feature = "icu") {
         extensions.push("icu");
     }
@@ -597,7 +476,15 @@ fn link_system_libs() {
         "macos" => {
             println!("cargo:rustc-link-lib=dylib=c++");
         }
-        "windows" => link_windows_system_libs(),
+        "windows" => {
+            println!("cargo:rustc-link-lib=dylib=ws2_32");
+            println!("cargo:rustc-link-lib=dylib=rstrtmgr");
+            if is_compiler("msvc") {
+                println!("cargo:rustc-link-lib=dylib=bcrypt");
+            } else {
+                println!("cargo:rustc-link-lib=dylib=stdc++");
+            }
+        }
         other => {
             panic!(
                 "bundled-cmake is currently supported only on Linux, macOS, and Windows; unsupported target OS `{other}`"

@@ -55,7 +55,7 @@
 //! ```
 #![warn(missing_docs)]
 
-pub use libduckdb_sys::v1 as ffi;
+pub use libduckdb_sys as ffi;
 
 use std::{
     cell::RefCell,
@@ -81,7 +81,6 @@ pub use crate::{
     ffi::ErrorCode,
     inner_connection::InterruptHandle,
     params::{Params, ParamsFromIter, params_from_iter},
-    progress::{ProgressHandle, QueryProgress},
     row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows},
     statement::Statement,
     transaction::{DropBehavior, Transaction},
@@ -105,14 +104,9 @@ mod error;
 mod appender;
 mod appender_params;
 mod arrow_batch;
-#[cfg(feature = "vtab-arrow")]
-mod arrow_interop;
 mod cache;
-#[cfg(any(feature = "vscalar", feature = "vtab"))]
-mod callback;
 mod column;
 mod config;
-mod executed_result;
 mod inner_connection;
 mod params;
 
@@ -137,7 +131,6 @@ mod transaction;
 mod extension;
 
 pub mod profiling;
-pub mod progress;
 pub mod types;
 /// The duckdb table function interface
 #[cfg(feature = "vtab")]
@@ -207,30 +200,6 @@ macro_rules! params {
 ///         },
 ///         |row| row.get(0),
 ///     )
-/// }
-/// ```
-///
-/// An owned list is a [`Value::List`](crate::types::Value::List).
-/// Pass that value under a bare name.
-/// Write the SQL placeholder as `$names`, with no parentheses around it.
-///
-/// ```rust
-/// use duckdb::types::Value;
-/// use duckdb::{Connection, Result, named_params};
-///
-/// fn main() -> Result<()> {
-///     let conn = Connection::open_in_memory()?;
-///     conn.execute_batch(
-///         "CREATE TABLE items(name VARCHAR);
-///          INSERT INTO items VALUES ('alpha'), ('other');",
-///     )?;
-///     let names = Value::List(vec![Value::Text("alpha".to_string())]);
-///     let mut stmt = conn.prepare("SELECT name FROM items WHERE name IN $names ORDER BY name")?;
-///     let found: Vec<String> = stmt
-///         .query_map(named_params! { "names": names }, |row| row.get(0))?
-///         .collect::<Result<_>>()?;
-///     assert_eq!(found, vec!["alpha".to_string()]);
-///     Ok(())
 /// }
 /// ```
 #[macro_export]
@@ -600,7 +569,7 @@ impl Connection {
     ///
     /// Will return `Err` if `table` not exists
     pub fn appender_to_db(&self, table: &str, schema: &str) -> Result<Appender<'_>> {
-        self.db.borrow_mut().appender(self, None, schema, table)
+        self.db.borrow_mut().appender(self, table, schema)
     }
 
     /// Create an Appender for fast import data with provided catalog, schema and table
@@ -620,7 +589,9 @@ impl Connection {
     ///
     /// Will return `Err` if `catalog` or `schema` not exists
     pub fn appender_to_catalog_and_db(&self, table: &str, catalog: &str, schema: &str) -> Result<Appender<'_>> {
-        self.db.borrow_mut().appender(self, Some(catalog), schema, table)
+        self.db
+            .borrow_mut()
+            .appender_to_catalog_and_db(self, table, catalog, schema)
     }
 
     /// Create an Appender that only provides values for specific columns.
@@ -656,7 +627,7 @@ impl Connection {
     pub fn appender_with_columns_to_db(&self, table: &str, schema: &str, columns: &[&str]) -> Result<Appender<'_>> {
         self.db
             .borrow_mut()
-            .appender_with_columns(self, None, schema, table, columns)
+            .appender_with_columns(self, table, schema, None, columns)
     }
 
     /// Create an Appender that only provides values for specific columns, with catalog and schema.
@@ -671,7 +642,7 @@ impl Connection {
     ) -> Result<Appender<'_>> {
         self.db
             .borrow_mut()
-            .appender_with_columns(self, Some(catalog), schema, table, columns)
+            .appender_with_columns(self, table, schema, Some(catalog), columns)
     }
 
     /// Get a handle to interrupt long-running queries.
@@ -767,6 +738,36 @@ mod test {
 
     pub fn checked_memory_handle() -> Connection {
         Connection::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn test_native_csv_exception_returns_error() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-utf8.csv");
+        let mut contents = b"value\n".to_vec();
+        contents.extend_from_slice(b"invalid\xff\n");
+        contents.extend(b"valid\n".repeat(4096));
+        std::fs::write(&path, contents).unwrap();
+
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("SET threads = 2")?;
+        let filename = path.to_string_lossy().replace('\'', "''");
+        let result: Result<i64> = db.query_row(
+            &format!(
+                "SELECT sum(length(value)) FROM read_csv('{filename}', \
+                 auto_detect = false, header = true, columns = {{'value': 'VARCHAR'}}, \
+                 parallel = true, buffer_size = 1024, max_line_size = 128)"
+            ),
+            [],
+            |row| row.get(0),
+        );
+        let error = result.expect_err("invalid UTF-8 must return a native error");
+        assert!(matches!(error, Error::DuckDBFailure(_, _)));
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(message.contains("unicode") || message.contains("utf-8"), "{message}");
+        let answer: i32 = db.query_row("SELECT 42", [], |row| row.get(0))?;
+        assert_eq!(answer, 42);
+        Ok(())
     }
 
     #[test]
@@ -1541,6 +1542,9 @@ mod test {
 
     #[test]
     fn test_stream_arrow_with_call() -> Result<()> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
         let db = checked_memory_handle();
 
         db.execute_batch(
@@ -1550,8 +1554,13 @@ mod test {
 
         db.execute_batch("CREATE MACRO test_func() AS TABLE SELECT * FROM test_data;")?;
 
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
         let mut stmt = db.prepare("CALL test_func()")?;
-        let rbs: Vec<RecordBatch> = stmt.stream_arrow([])?.collect::<Result<Vec<_>>>()?;
+        let rbs: Vec<RecordBatch> = stmt.stream_arrow([], schema)?.collect();
 
         // Verify we got results
         assert!(!rbs.is_empty(), "Expected at least one record batch");
@@ -1560,67 +1569,6 @@ mod test {
 
         let id_column = rbs[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(id_column.value(0), 1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_stream_arrow_error_during_streaming() -> Result<()> {
-        let db = checked_memory_handle();
-
-        // We want to specifically test the case where streaming starts successfully,
-        // then an error occurs during a later fetch. A deterministic way to trigger
-        // this is to interrupt the connection mid-stream.
-        let db_interrupt = db.interrupt_handle();
-
-        let mut stmt = db.prepare("SELECT i FROM range(1000000000) t(i)")?;
-        let mut stream = stmt.stream_arrow([])?;
-
-        // Fetch at least one batch to ensure the stream has started.
-        let first = stream.next().expect("Expected at least one batch from stream");
-        assert!(first.is_ok(), "Expected first batch to be Ok, got: {first:?}");
-
-        // Interrupt the connection, then the next fetch should return an error (not end-of-stream).
-        db_interrupt.interrupt();
-
-        let err = stream
-            .next()
-            .expect("Expected an error after interrupt")
-            .expect_err("Expected streaming error after interrupt, got Ok batch");
-        assert!(
-            err.to_string().contains("INTERRUPT"),
-            "Expected interrupt error, got: {err}"
-        );
-
-        // The stream is exhausted after an error, and the schema is still available.
-        assert!(stream.next().is_none());
-        assert_eq!(stream.get_schema().fields().len(), 1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_stream_arrow_successful_completion() -> Result<()> {
-        let db = checked_memory_handle();
-
-        // Create a table with valid data
-        db.execute_batch(
-            "CREATE TABLE test_data(value INTEGER);
-             INSERT INTO test_data SELECT i FROM range(100) AS t(i);",
-        )?;
-
-        let mut stmt = db.prepare("SELECT value FROM test_data")?;
-        let mut stream = stmt.stream_arrow([])?;
-
-        // Collect results - all should be successful
-        let batches = stream.by_ref().collect::<Result<Vec<_>>>()?;
-
-        // Verify we got all 100 rows
-        let total_rows: usize = batches.iter().map(|rb| rb.num_rows()).sum();
-        assert_eq!(total_rows, 100);
-
-        // Verify the iterator is fused: exhausted stream yields None
-        assert!(stream.next().is_none());
 
         Ok(())
     }
@@ -1660,36 +1608,16 @@ mod test {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // The interrupt can land while the statement is still being prepared
-            // (prepare() itself surfaces it as an INTERRUPT error) or once the
-            // query starts executing.
-            let result = db
+            let mut stmt = db
                 .prepare("select count(*) from range(10000000) t1, range(1000000) t2")
-                .and_then(|mut stmt| stmt.execute([]));
-            tx.send(result).unwrap();
+                .unwrap();
+            tx.send(stmt.execute([])).unwrap();
         });
 
-        // DuckDB resets the interrupt flag when a query starts executing, so an
-        // interrupt that arrives while the worker is still preparing is discarded.
-        // Keep signalling until the query reacts; a single fixed-delay interrupt
-        // is missed whenever the worker is descheduled past the sleep.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let result = loop {
-            db_interrupt.interrupt();
-            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(result) => break result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "query never observed the interrupt"
-                    );
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("query thread exited without returning a result")
-                }
-            }
-        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        db_interrupt.interrupt();
 
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(result.is_err_and(|err| err.to_string().contains("INTERRUPT")));
         Ok(())
     }
