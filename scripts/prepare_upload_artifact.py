@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy successful GitHub build artifact ZIPs unchanged to a Generic repository."""
+"""Prepare verified native-build ZIPs for a later manual upload."""
 
 import argparse
 import hashlib
@@ -10,7 +10,6 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
 
 ARTIFACT_NAMES = {
     "duckdb-rs-fork-Linux-ARM64", "duckdb-rs-fork-Linux-X64",
@@ -30,38 +29,7 @@ def digest(path):
     return value.hexdigest()
 
 
-def upload(path, url, token):
-    # Never propagate CalledProcessError here: its command includes the token.
-    result = subprocess.run(
-        ["curl", "--silent", "--show-error", "--fail", "--retry", "3",
-         "--connect-timeout", "30", "--max-time", "600",
-         "--request", "PUT", "--upload-file", str(path),
-         "--header", f"Authorization: Bearer {token}",
-         "--header", f"X-Checksum-Sha256: {digest(path)}",
-         "--output", os.devnull, "--write-out", "%{http_code}", url],
-        capture_output=True, text=True,
-    )
-    status = result.stdout.strip()
-    if result.returncode or status not in {"200", "201"}:
-        raise RuntimeError(
-            f"Upload failed for {path.name} (HTTP {status or 'unavailable'}, "
-            f"curl exit {result.returncode}). Check connectivity and deploy permission."
-        )
-
-
-def archive(args):
-    token = os.environ.get("ARTIFACTORY_ACCESS_TOKEN", "").strip()
-    if not args.dry_run and not token:
-        raise RuntimeError("Configure GitHub Actions secret ARTIFACTORY_ACCESS_TOKEN before uploading.")
-    base = os.environ.get("ARTIFACTORY_BASE_URL", "https://gart.software.gevernova.com/artifactory").rstrip("/")
-    repo = os.environ.get("ARTIFACTORY_GENERIC_REPOSITORY", "data-fabric-generic")
-    prefix = os.environ.get("ARTIFACTORY_ARCHIVE_PREFIX", "duckdb-rs").strip("/")
-    parsed = urlparse(base)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise RuntimeError("ARTIFACTORY_BASE_URL must be an HTTPS base URL without credentials or query parameters.")
-    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", part) or part in {".", ".."}
-           for part in [repo, *prefix.split("/")]):
-        raise RuntimeError("Invalid Generic repository key or archive prefix.")
+def prepare(args):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         raise RuntimeError("Invalid GitHub repository name.")
 
@@ -87,9 +55,8 @@ def archive(args):
     if any(item["expired"] for item in artifacts):
         raise RuntimeError("A source artifact has expired; use a successful run with retained artifacts.")
 
-    output = args.output_dir / str(args.run_id)
+    output = args.output_dir / str(args.run_id) / f"attempt-{int(run['run_attempt'])}"
     output.mkdir(parents=True, exist_ok=True)
-    destination = f"{base}/{repo}/{prefix}/{sha}/run-{args.run_id}/attempt-{int(run['run_attempt'])}"
     files = []
     fork_pin = None
     for item in sorted(artifacts, key=lambda entry: entry["name"]):
@@ -117,34 +84,35 @@ def archive(args):
     manifest = output / "archive-manifest.json"
     manifest.write_text(json.dumps({"repository": args.repository, "source_run_id": args.run_id,
         "source_run_attempt": run["run_attempt"], "source_url": run["html_url"],
-        "source_commit": sha, "duckdb": fork_pin, "destination": destination,
+        "source_commit": sha, "duckdb": fork_pin,
         "files": files}, indent=2) + "\n")
     checksums = output / "SHA256SUMS"
     checksums.write_text("".join(f"{item['sha256']}  {item['name']}\n" for item in files)
                          + f"{digest(manifest)}  {manifest.name}\n")
-    paths = [output / item["name"] for item in files] + [manifest, checksums]
-    if not args.dry_run:
-        for path in paths:
-            upload(path, f"{destination}/{path.name}", token)
-            print(f"Uploaded {path.name}")
-    result = f"{'Dry run: verified' if args.dry_run else 'Archived'} {len(files)} original ZIPs.\nDestination: {destination}"
-    print(result)
+    artifact_name = f"duckdb-rs-manual-upload-{args.run_id}-attempt-{int(run['run_attempt'])}"
+    print(f"Prepared {len(files)} verified platform ZIPs for manual upload: {output}")
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as outputs:
+            outputs.write(f"directory={output}\nartifact_name={artifact_name}\n")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-            summary.write(f"{result}\n\nSource: {run['html_url']}\n")
+            summary.write(
+                f"Prepared **{artifact_name}** from [native build {args.run_id}]({run['html_url']}).\n\n"
+                "Download this workflow's artifact ZIP and upload it manually to the Generic repository. "
+                "It contains the four original platform ZIPs, archive-manifest.json, and SHA256SUMS.\n"
+            )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", type=int, required=True)
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "pegasi-e/duckdb-rs"))
-    parser.add_argument("--output-dir", type=Path, default=Path("target/artifactory-archive"))
-    parser.add_argument("--dry-run", action="store_true", default=os.environ.get("ARCHIVE_DRY_RUN", "").lower() == "true")
+    parser.add_argument("--output-dir", type=Path, default=Path("target/manual-upload"))
     args = parser.parse_args()
     if args.run_id <= 0:
         parser.error("--run-id must be positive")
     try:
-        archive(args)
+        prepare(args)
     except (RuntimeError, subprocess.CalledProcessError) as error:
         sys.exit(str(error))
 

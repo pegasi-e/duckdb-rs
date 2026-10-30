@@ -1,36 +1,40 @@
-name: Archive build ZIPs
+name: Prepare manual upload
 on:
+  workflow_run:
+    workflows: [Bundled fork]
+    types: [completed]
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: Successful Bundled fork workflow run to archive
+        description: Successful Bundled fork run to package for manual upload
         required: true
         type: string
         default: "40962050450"
-      dry_run:
-        description: Download and verify ZIPs without uploading to Artifactory
-        type: boolean
-        default: false
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: archive-build-zips-${{ inputs.source_run_id }}
+  group: manual-upload-${{ github.event.workflow_run.id || inputs.source_run_id }}
   cancel-in-progress: false
 jobs:
-  archive:
+  package:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    env:
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
     steps:
       - uses: actions/checkout@v5
-      - name: Check archive behavior
-        run: python3 -m unittest discover -s scripts -p test_archive_artifacts.py
-      - name: Archive original GitHub artifact ZIPs
+      - name: Check packaging behavior
+        run: python3 -m unittest discover -s scripts -p test_prepare_upload_artifact.py
+      - name: Collect and verify native build ZIPs
+        id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          ARCHIVE_DRY_RUN: ${{ inputs.dry_run }}
-          ARTIFACTORY_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
-          ARTIFACTORY_BASE_URL: ${{ vars.ARTIFACTORY_BASE_URL || 'https://gart.software.gevernova.com/artifactory' }}
-          ARTIFACTORY_GENERIC_REPOSITORY: ${{ vars.ARTIFACTORY_GENERIC_REPOSITORY || 'data-fabric-generic' }}
-          ARTIFACTORY_ARCHIVE_PREFIX: ${{ vars.ARTIFACTORY_ARCHIVE_PREFIX || 'duckdb-rs' }}
-        run: python3 scripts/archive_artifacts.py --run-id "$SOURCE_RUN_ID"
+        run: python3 scripts/prepare_upload_artifact.py --run-id "$SOURCE_RUN_ID"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.artifact_name }}
+          path: ${{ steps.prepare.outputs.directory }}/
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
