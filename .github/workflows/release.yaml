@@ -1,4 +1,4 @@
-name: Prepare manual upload
+name: Prepare Cargo registry
 on:
   workflow_run:
     workflows: [Bundled fork]
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: Successful Bundled fork run to package for manual upload
+        description: Successful Bundled fork run to package as a Cargo registry
         required: true
         type: string
         default: "40962050450"
@@ -14,7 +14,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: manual-upload-${{ github.event.workflow_run.id || inputs.source_run_id }}
+  group: cargo-registry-history
   cancel-in-progress: false
 jobs:
   package:
@@ -24,9 +24,13 @@ jobs:
       SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Check packaging behavior
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
-      - name: Collect and verify native build ZIPs
+        run: python3 -m unittest discover -s scripts -p "test_*.py"
+      - name: Prepare registry from verified native builds
         id: prepare
         env:
           GH_TOKEN: ${{ github.token }}

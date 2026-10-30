@@ -46,39 +46,59 @@ together, then run `./upgrade.sh`. This preserves the public Rust bindings.
 The source commit must match the pin and have no tracked modifications.
 The bundle checksum is recorded in `duckdb.tar.gz.sha256`.
 
-CI builds bundled crates on Linux x86-64 and ARM64, macOS, and Windows. It uploads
-Cargo packages, the complete source workspace, and the host smoke executable. Extract the source
-workspace archive to use the local `path` dependency shown above; it retains the
-internal path dependencies so the engine stays on this fork. Individual `.crate`
-files retain upstream names and versions: consuming them separately requires
-patching both crates to local paths or configuring a private registry. Prefer
-the Git dependency or complete source workspace for applications.
-Rust `.rlib` files are compiler/target specific and are not portable SDKs.
+CI builds bundled crates on Linux x86-64 and ARM64, macOS, and Windows. Native
+artifacts retain the original source packages and smoke executables.
 
-After **Bundled fork** completes successfully, the separate **Prepare manual
-upload** workflow (`release.yaml`) collects all four platform artifact ZIPs.
-It verifies their SHA-256 digests and shared DuckDB provenance, then uploads a
-single GitHub Actions artifact named
-`duckdb-rs-manual-upload-<source-run-id>-attempt-<n>`.
+After **Bundled fork** completes successfully, **Prepare Cargo registry**
+(`release.yaml`) verifies all four native artifacts and produces
+`duckdb-rs-cargo-registry-<source-run-id>-attempt-<n>`. This contains a read-only
+Cargo sparse index, the three source crates, SHA-256 checksums, provenance,
+`cargo-client-config.toml`, and `CARGO_REGISTRY_SETUP.md`.
 
-Download that artifact ZIP and upload it manually to your Artifactory Generic
-repository. It contains the four original platform ZIPs unchanged, plus
-`archive-manifest.json`, `SHA256SUMS`, and a standalone `bootstrap_duckdb.py`
-with [application setup instructions](scripts/APPLICATION_SETUP.md). Applications
-can run that helper with `--bundle /path/to/downloaded.zip --manifest-path
-/path/to/application/Cargo.toml` to verify and extract the workspace and
-configure Cargo's path dependency and matching patches automatically.
-No Artifactory credentials, connection,
-Cargo registry publishing, or crate version changes are involved.
+Extract the artifact ZIP and upload its **contents**, preserving directories, to:
 
-GitHub enables the automatic `workflow_run` trigger once this workflow is on
-the default branch (`main`). Failed or cancelled native builds do not produce
-a manual-upload bundle. The packaging workflow also supports a manual
-`workflow_dispatch` trigger with a successful native build run ID, including
-existing run `40962050450`. Local preparation uses GitHub CLI authentication:
+```text
+https://gart.software.gevernova.com/artifactory/data-fabric-generic/duckdb-rs/cargo/
+```
+
+Upload `crates/` before `index/`. The Generic repository serves the static Cargo
+registry directly; uploading just the ZIP is insufficient. No Artifactory
+credentials or automatic uploads are used by CI.
+
+Applications configure the registry once in `.cargo/config.toml`:
+
+```toml
+[registries.pegasi]
+index = "sparse+https://gart.software.gevernova.com/artifactory/data-fabric-generic/duckdb-rs/cargo/index/"
+credential-provider = "cargo:token"
+```
+
+Supply local read authentication through `CARGO_REGISTRIES_PEGASI_TOKEN`
+(`Bearer ` followed by an Artifactory access token), then use:
 
 ```sh
-python3 scripts/prepare_upload_artifact.py --run-id 40962050450
+cargo add duckdb --registry pegasi --features bundled
+```
+
+Cargo resolves both internal dependencies from this registry and public dependencies
+from crates.io or your configured mirror. It compiles the bundled DuckDB **1.5.6**
+fork using your C++ toolchain. No bootstrap script or path dependencies are needed.
+The standard Rust API remains unchanged. Distribution versions are unique to the
+native build, for example `1.10506.40981861127001`; upstream source versions remain
+unchanged in this repository.
+
+Each registry snapshot retains earlier releases for existing Cargo.lock files.
+The packaging workflow imports the latest successful registry artifact from
+GitHub, and fails if that snapshot has expired. Keep a copy of the published
+snapshot; `--previous-registry` can restore it locally. Never overwrite a newer
+published index with an older snapshot.
+
+The automatic trigger activates after the workflow reaches `main`. Failed native
+builds do not produce registry bundles. To package an existing successful native
+build, dispatch **Prepare Cargo registry** with its run ID, or run locally:
+
+```sh
+python3 scripts/prepare_upload_artifact.py --run-id 40981861127
 ```
 
 ---
