@@ -63,7 +63,12 @@ single GitHub Actions artifact named
 
 Download that artifact ZIP and upload it manually to your Artifactory Generic
 repository. It contains the four original platform ZIPs unchanged, plus
-`archive-manifest.json` and `SHA256SUMS`. No Artifactory credentials, connection,
+`archive-manifest.json`, `SHA256SUMS`, and a standalone `bootstrap_duckdb.py`
+with [application setup instructions](scripts/APPLICATION_SETUP.md). Applications
+can run that helper with `--bundle /path/to/downloaded.zip --manifest-path
+/path/to/application/Cargo.toml` to verify and extract the workspace and
+configure Cargo's path dependency and matching patches automatically.
+No Artifactory credentials, connection,
 Cargo registry publishing, or crate version changes are involved.
 
 GitHub enables the automatic `workflow_run` trigger once this workflow is on

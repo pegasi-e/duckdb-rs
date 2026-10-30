@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Check packaging behavior
-        run: python3 -m unittest discover -s scripts -p test_prepare_upload_artifact.py
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Collect and verify native build ZIPs
         id: prepare
         env:

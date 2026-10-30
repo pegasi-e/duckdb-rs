@@ -82,12 +82,17 @@ def prepare(args):
         print(f"Verified {path.name}: {checksum}")
 
     manifest = output / "archive-manifest.json"
+    support = []
+    for name in ["bootstrap_duckdb.py", "APPLICATION_SETUP.md"]:
+        path = output / name
+        path.write_bytes((Path(__file__).resolve().parent / name).read_bytes())
+        support.append({"name": name, "sha256": digest(path), "size": path.stat().st_size})
     manifest.write_text(json.dumps({"repository": args.repository, "source_run_id": args.run_id,
         "source_run_attempt": run["run_attempt"], "source_url": run["html_url"],
         "source_commit": sha, "duckdb": fork_pin,
-        "files": files}, indent=2) + "\n")
+        "files": files, "support_files": support}, indent=2) + "\n")
     checksums = output / "SHA256SUMS"
-    checksums.write_text("".join(f"{item['sha256']}  {item['name']}\n" for item in files)
+    checksums.write_text("".join(f"{item['sha256']}  {item['name']}\n" for item in files + support)
                          + f"{digest(manifest)}  {manifest.name}\n")
     artifact_name = f"duckdb-rs-manual-upload-{args.run_id}-attempt-{int(run['run_attempt'])}"
     print(f"Prepared {len(files)} verified platform ZIPs for manual upload: {output}")
@@ -99,7 +104,8 @@ def prepare(args):
             summary.write(
                 f"Prepared **{artifact_name}** from [native build {args.run_id}]({run['html_url']}).\n\n"
                 "Download this workflow's artifact ZIP and upload it manually to the Generic repository. "
-                "It contains the four original platform ZIPs, archive-manifest.json, and SHA256SUMS.\n"
+                "It contains the four original platform ZIPs, archive-manifest.json, SHA256SUMS, "
+                "and bootstrap_duckdb.py with application setup instructions.\n"
             )
 
 

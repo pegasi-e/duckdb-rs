@@ -67,7 +67,9 @@ class PackagingTests(unittest.TestCase):
         for line in (output / "SHA256SUMS").read_text().splitlines():
             checksum, name = line.split("  ", 1)
             self.assertEqual(checksum, subject.digest(output / name))
-        self.assertEqual(6, len(list(output.iterdir())))
+        self.assertEqual(8, len(list(output.iterdir())))
+        self.assertEqual({"bootstrap_duckdb.py", "APPLICATION_SETUP.md"},
+                         {item["name"] for item in manifest["support_files"]})
 
     def test_github_outputs_identify_only_the_source_run_attempt(self):
         outputs = self.args.output_dir / "outputs.txt"
