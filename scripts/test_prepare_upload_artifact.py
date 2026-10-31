@@ -77,7 +77,8 @@ class PackagingTests(unittest.TestCase):
         summary = self.args.output_dir / "summary.md"
         self.perform({"GITHUB_OUTPUT": str(outputs), "GITHUB_STEP_SUMMARY": str(summary)})
         self.assertIn("artifact_name=duckdb-rs-cargo-registry-123-attempt-2", outputs.read_text())
-        self.assertIn(f"directory={self.args.output_dir}/registry/123/attempt-2", outputs.read_text())
+        expected_directory = self.args.output_dir / "registry" / "123" / "attempt-2"
+        self.assertIn(f"directory={expected_directory}", outputs.read_text())
         self.assertIn("upload its contents manually", summary.read_text())
 
     def test_rejects_failed_source_run(self):
