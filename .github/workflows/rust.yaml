@@ -22,7 +22,12 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Test Cargo registry packaging and consumption
+        run: python3 -m unittest discover -s scripts -p "test_*.py"
       - name: Check DuckDB fork compatibility
         run: python3 scripts/check_fork_compat.py
       - run: cargo fmt --all -- --check

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import prepare_upload_artifact as subject
+from test_build_sparse_registry import crates
 
 
 class PackagingTests(unittest.TestCase):
@@ -21,14 +22,14 @@ class PackagingTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.args = argparse.Namespace(run_id=123, repository="pegasi-e/duckdb-rs",
-                                       output_dir=Path(self.tmp.name))
+                                       output_dir=Path(self.tmp.name), base_url="https://example.com/cargo", previous_registry=None)
         self.run = {"status": "completed", "conclusion": "success",
                     "path": ".github/workflows/rust.yaml", "head_sha": "a" * 40,
-                    "run_attempt": 2, "html_url": "https://github.com/pegasi-e/duckdb-rs/actions/runs/123"}
+                    "id": 123, "run_attempt": 2, "html_url": "https://github.com/pegasi-e/duckdb-rs/actions/runs/123"}
         self.payloads = {}
         self.artifacts = []
         for artifact_id, name in enumerate(sorted(subject.ARTIFACT_NAMES), 1):
-            payload = self.zip_payload("d" * 40)
+            payload = self.zip_payload(json.loads((Path(subject.__file__).resolve().parent.parent / "crates/libduckdb-sys/duckdb-fork.json").read_text())["commit"])
             self.payloads[artifact_id] = payload
             self.artifacts.append({"id": artifact_id, "name": name, "expired": False,
                                    "digest": "sha256:" + hashlib.sha256(payload).hexdigest()})
@@ -38,7 +39,9 @@ class PackagingTests(unittest.TestCase):
         data = io.BytesIO()
         with zipfile.ZipFile(data, "w") as bundle:
             bundle.writestr("crates/libduckdb-sys/duckdb-fork.json",
-                            json.dumps({"version": "1.5.6", "commit": commit}))
+                            json.dumps({**json.loads((Path(subject.__file__).resolve().parent.parent / "crates/libduckdb-sys/duckdb-fork.json").read_text()), "commit": commit}))
+            for name, payload in crates().items():
+                bundle.writestr(f"target/package/{name}-1.10503.1.crate", payload)
         return data.getvalue()
 
     def download(self, command, **kwargs):
@@ -49,7 +52,7 @@ class PackagingTests(unittest.TestCase):
 
     def perform(self, environment=None):
         with patch.dict(os.environ, environment or {}, clear=True), \
-             patch.object(subject, "gh_json", side_effect=[self.run, {"artifacts": self.artifacts}]), \
+             patch.object(subject, "gh_json", side_effect=[self.run, {"artifacts": self.artifacts}, {"artifacts": []}]), \
              patch.object(subject.subprocess, "run", side_effect=self.download) as downloads:
             subject.prepare(self.args)
             self.assertEqual(4, downloads.call_count)
@@ -73,9 +76,10 @@ class PackagingTests(unittest.TestCase):
         outputs = self.args.output_dir / "outputs.txt"
         summary = self.args.output_dir / "summary.md"
         self.perform({"GITHUB_OUTPUT": str(outputs), "GITHUB_STEP_SUMMARY": str(summary)})
-        self.assertIn("artifact_name=duckdb-rs-manual-upload-123-attempt-2", outputs.read_text())
-        self.assertIn(f"directory={self.args.output_dir}/123/attempt-2", outputs.read_text())
-        self.assertIn("upload it manually", summary.read_text())
+        self.assertIn("artifact_name=duckdb-rs-cargo-registry-123-attempt-2", outputs.read_text())
+        expected_directory = self.args.output_dir / "registry" / "123" / "attempt-2"
+        self.assertIn(f"directory={expected_directory}", outputs.read_text())
+        self.assertIn("upload its contents manually", summary.read_text())
 
     def test_rejects_failed_source_run(self):
         self.run["conclusion"] = "failure"
@@ -109,6 +113,31 @@ class PackagingTests(unittest.TestCase):
         artifact["digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
         with self.assertRaisesRegex(RuntimeError, "disagree"):
             self.perform()
+
+class RegistryHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.args = argparse.Namespace(repository='pegasi-e/duckdb-rs', output_dir=Path(self.tmp.name), previous_registry=None)
+        self.item = {'id': 99, 'name': 'duckdb-rs-cargo-registry-123-attempt-1', 'workflow_run': {'id': 789}, 'expired': False}
+        self.run = {'status': 'completed', 'conclusion': 'success', 'path': '.github/workflows/release.yaml'}
+
+    def test_never_resets_expired_history(self):
+        self.item['expired'] = True
+        with patch.object(subject, 'gh_json', side_effect=[{'artifacts': [self.item]}, self.run]):
+            with self.assertRaisesRegex(RuntimeError, 'history must not be reset'):
+                subject.previous_registry(self.args)
+
+    def test_explicit_saved_snapshot_does_not_need_github(self):
+        self.args.previous_registry = Path('saved.zip')
+        with patch.object(subject, 'gh_json') as api:
+            self.assertEqual(Path('saved.zip'), subject.previous_registry(self.args))
+            api.assert_not_called()
+
+    def test_skips_failed_packaging_run(self):
+        self.run['conclusion'] = 'failure'
+        with patch.object(subject, 'gh_json', side_effect=[{'artifacts': [self.item]}, self.run]):
+            self.assertIsNone(subject.previous_registry(self.args))
 
 
 if __name__ == "__main__":
